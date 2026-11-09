@@ -374,6 +374,25 @@ def tem_carteira(bases: Bases, cnpj: str) -> bool:
     return digitos(cnpj) in bases.carteira_por_cnpj
 
 
+def formatar_cnpj(cnpj) -> str:
+    d = digitos(cnpj)
+    return f"{d[:2]}.{d[2:5]}.{d[5:8]}/{d[8:12]}-{d[12:]}" if len(d) == 14 else str(cnpj)
+
+
+def fundos_fora_da_lista(bases: Bases) -> list[tuple[str, str]]:
+    """CNPJs da Carteira Informe que não estão na lista de fundos: (CNPJ formatado, nome provável).
+
+    O nome provável vem do título do card do Pipefy, quando houver.
+    """
+    fora = []
+    for cnpj in bases.carteira_por_cnpj:
+        if cnpj and cnpj not in bases.nome_por_cnpj:
+            card = bases.pipefy_por_cnpj.get(cnpj)
+            nome = str(coluna(card, "Title") or "").strip() if card else ""
+            fora.append((formatar_cnpj(cnpj), nome))
+    return fora
+
+
 def nome_do_fundo(bases: Bases, cnpj: str) -> str:
     """Setup!C7 =XLOOKUP(cnpj, H:H, G:G): primeiro nome da lista com esse CNPJ."""
     return bases.nome_por_cnpj.get(digitos(cnpj), "")
@@ -1271,9 +1290,19 @@ def cmd_gerar(args, cfg):
     texto_padrao = cfg["texto_gestor_sem_resposta"]
     formatos = {"pdf", "xlsx"} if args.formato == "ambos" else {args.formato}
 
+    resumo, erros = [], 0
     if args.cnpj:
         alvo = [c.strip() for c in args.cnpj]
     else:
+        fora = fundos_fora_da_lista(bases)
+        if fora:
+            print(f"[AVISO] {len(fora)} fundo(s) na Carteira Informe que não estão na lista de fundos "
+                  "(não gerados; inclua nome e CNPJ em fundos.xlsx): "
+                  + "; ".join(f"{c} {n}".strip() for c, n in fora))
+        for c, n in fora:
+            resumo.append({"fundo": n, "cnpj": c, "pl": "", "arquivo": "",
+                           "avisos": "NÃO GERADO: está na Carteira Informe mas não na lista de fundos "
+                                     "(inclua nome e CNPJ em fundos.xlsx)"})
         # imprimir_exportar: percorre a lista e gera só quem "Tem Informe?" = SIM
         alvo = [f["cnpj"] for f in bases.fundos if tem_carteira(bases, f["cnpj"])]
         pulados = [f["nome"] or f["cnpj"] for f in bases.fundos if not tem_carteira(bases, f["cnpj"])]
@@ -1290,7 +1319,7 @@ def cmd_gerar(args, cfg):
 
     pasta_validados = Path(args.validados) if args.validados else None
     validados = list(pasta_validados.glob("*.xlsx")) if pasta_validados else []
-    resumo, erros = [], 0
+    nao_listados = len(resumo)
     inicio = time.perf_counter()
     for cnpj in alvo:
         rel = None
@@ -1321,8 +1350,11 @@ def cmd_gerar(args, cfg):
         w = csv.DictWriter(f, fieldnames=["fundo", "cnpj", "pl", "arquivo", "avisos"], delimiter=";")
         w.writeheader()
         w.writerows(resumo)
-    print(f"\nExportação em lote concluída: {len(resumo) - erros} fundo(s) em {saida} "
+    print(f"\nExportação em lote concluída: {len(resumo) - erros - nao_listados} fundo(s) em {saida} "
           f"({time.perf_counter() - inicio:.1f}s)")
+    if nao_listados:
+        print(f"[AVISO] {nao_listados} fundo(s) da carteira ficaram de fora por não estarem na lista; "
+              "veja o resumo.")
     print(f"Resumo com avisos por fundo: {saida / 'resumo_geracao.csv'}")
     if erros:
         print(f"[ERRO] {erros} fundo(s) não foram gerados; veja o resumo.")
