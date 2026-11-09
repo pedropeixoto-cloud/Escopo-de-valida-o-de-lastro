@@ -1314,7 +1314,8 @@ LINHAS_CONFERIDAS = {
 }
 
 # Subpastas da pasta de saída (config.json -> "subpastas")
-SUBPASTAS_PADRAO = {"revisados": "Relatórios revisados", "revisao_humana": "Revisão humana"}
+SUBPASTAS_PADRAO = {"revisados": "Relatórios revisados", "insumos": "Insumos",
+                    "revisao_humana": "Revisão humana"}
 
 STATUS_OK = "OK"
 STATUS_CORRIGIDO = "corrigido com a CVM"
@@ -1459,18 +1460,20 @@ def cmd_gerar(args, cfg):
     data_base = para_data(args.data_base or cfg["data_base"])
     saida = Path(args.saida) if args.saida else caminho_cfg(cfg, "saida")
     caminho_gravavel(saida).mkdir(parents=True, exist_ok=True)
-    # Com a conferência da CVM, os arquivos vão para duas subpastas da saída:
-    # os que batem com o informe (revisados) e os que precisam de revisão humana.
-    informe, revisados, revisao = None, saida, None
+    # Com a conferência da CVM, os arquivos vão para subpastas da saída:
+    #   batem com o informe -> PDF em "revisados" (pronto para emitir) e XLSX em "insumos"
+    #   não batem           -> PDF e XLSX em "revisão humana" (draft)
+    informe, revisados, insumos, revisao = None, saida, saida, None
     tolerancia = float(_cfg_cvm(cfg)["tolerancia"])
     if not args.sem_cvm:
         informe = ler_informe_cvm(baixar_informe_cvm(cfg, data_base), data_base)
         subpastas = {**SUBPASTAS_PADRAO, **cfg.get("subpastas", {})}
         revisados = saida / subpastas["revisados"]
+        insumos = saida / subpastas["insumos"]
         revisao = saida / subpastas["revisao_humana"]
-        for pasta in (revisados, revisao):
+        for pasta in (revisados, insumos, revisao):
             caminho_gravavel(pasta).mkdir(parents=True, exist_ok=True)
-    pastas_geradas = [p for p in {saida, revisados, revisao} if p is not None]
+    pastas_geradas = [p for p in {saida, revisados, insumos, revisao} if p is not None]
     modelo = carregar_modelo()
     rotulos = rotulos_composicao(modelo.ws)
     texto_padrao = cfg["texto_gestor_sem_resposta"]
@@ -1520,8 +1523,10 @@ def cmd_gerar(args, cfg):
                 rel.avisos.append("CNPJ não está na lista de fundos (nome em branco)")
             conf = conferir_cvm(rel, informe, tolerancia) if informe is not None else None
             revisar = bool(conf and conf.revisar)
-            destino = revisao if revisar else revisados
+            destinos = {"pdf": revisao if revisar else revisados,
+                        "xlsx": revisao if revisar else insumos}
             for ext in sorted(formatos):
+                destino = destinos[ext]
                 for outra in pastas_geradas:  # se o fundo trocou de pasta desde a última geração, tira a cópia antiga
                     antigo = outra / f"{rel.nome_arquivo}.{ext}"
                     if outra != destino and antigo.is_file():
@@ -1537,7 +1542,7 @@ def cmd_gerar(args, cfg):
             resumo.append({"fundo": rel.nome, "cnpj": rel.cnpj, "pl": rel.celulas["C20"],
                            "arquivo": rel.nome_arquivo,
                            "conferencia_cvm": conf.status if conf else "não conferido",
-                           "pasta": str(destino), "avisos": " | ".join(rel.avisos)})
+                           "pasta": " | ".join(sorted({str(destinos[e]) for e in formatos})), "avisos": " | ".join(rel.avisos)})
             if revisar:
                 base_rev = {"fundo": rel.nome, "cnpj": rel.cnpj, "status": conf.status, "acao": conf.acao}
                 for linha, desc, a, b in conf.divergencias or [("", "", None, None)]:
@@ -1572,7 +1577,8 @@ def cmd_gerar(args, cfg):
     if revisao is not None:
         n_rev = len({r["cnpj"] for r in revisoes})
         n_ok = sum(1 for r in resumo if r.get("conferencia_cvm") == STATUS_OK)
-        print(f"Conferência com a CVM: {n_ok} fundo(s) batem com o informe em {revisados}")
+        print(f"Conferência com a CVM: {n_ok} fundo(s) batem com o informe: PDF em {revisados}")
+        print(f"                       e Excel em {insumos}")
         print(f"                       {n_rev} fundo(s) para revisão humana em {revisao} (detalhes em revisao_cvm.csv)")
     if erros:
         print(f"[ERRO] {erros} fundo(s) não foram gerados; veja o resumo.")

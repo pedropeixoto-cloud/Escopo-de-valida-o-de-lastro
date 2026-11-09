@@ -35,8 +35,9 @@ pip install -r requirements.txt
    ```
    _DRAFT\
      resumo_geracao.csv        PL, conferência com a CVM e avisos de cada fundo
-     Relatórios revisados\     fundos que batem com o Informe Mensal da CVM
-     Revisão humana\           fundos que não batem + revisao_cvm.csv
+     Relatórios revisados\     PDF dos fundos que batem com o Informe Mensal da CVM (prontos para emitir)
+     Insumos\                  Excel dos fundos que batem
+     Revisão humana\           PDF e Excel (drafts) dos fundos que não batem + revisao_cvm.csv
    ```
    Se algum fundo falhar, os demais são gerados, o erro vai para o resumo e o comando termina
    com código 1.
@@ -59,8 +60,8 @@ compara cada linha do quadro I com o informe do fundo:
 
 | Resultado | O que acontece | Pasta |
 |---|---|---|
-| Todas as linhas batem (diferença ≤ `cvm.tolerancia`, R$ 1) | nada | `Relatórios revisados` |
-| Diverge e o informe fecha (ativo − passivo = PL) | o relatório é **corrigido com o valor da CVM** e os % são recalculados | `Revisão humana` |
+| Todas as linhas batem (diferença ≤ `cvm.tolerancia`, R$ 1) | nada | PDF em `Relatórios revisados`, Excel em `Insumos` |
+| Diverge e o informe fecha (ativo − passivo = PL) | o relatório é **corrigido com o valor da CVM** e os % são recalculados | PDF e Excel em `Revisão humana` |
 | Diverge e o informe não fecha ou está zerado | mantém a carteira | `Revisão humana` |
 | Fundo sem informe na CVM no mês | mantém a carteira | `Revisão humana` |
 

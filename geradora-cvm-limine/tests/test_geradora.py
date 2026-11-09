@@ -22,7 +22,7 @@ import geradora_cvm as g  # noqa: E402
 DATA_BASE = dt.date(2026, 9, 30)
 TEXTO_PADRAO = json.loads((Path(g.BASE_DIR) / "config.json").read_text(encoding="utf-8"))["texto_gestor_sem_resposta"]
 
-OK_DIR, REV_DIR = g.SUBPASTAS_PADRAO["revisados"], g.SUBPASTAS_PADRAO["revisao_humana"]
+OK_DIR, INS_DIR, REV_DIR = (g.SUBPASTAS_PADRAO[k] for k in ("revisados", "insumos", "revisao_humana"))
 ALFA, BETA, GAMA = "11.111.111/0001-11", "22.222.222/0001-22", "33.333.333/0001-33"
 
 
@@ -256,7 +256,10 @@ class TestComandoGerar(Base):
         pasta = self.tmp / "saida"
         arquivos = sorted(p.name for p in (pasta / OK_DIR).iterdir())
         self.assertIn("FUNDO ALFA FIDC_11111111000111_TRIMESTRAL_CVM.pdf", arquivos)
-        self.assertIn("FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.xlsx", arquivos)
+        self.assertFalse([a for a in arquivos if a.endswith(".xlsx")])       # Excel vai para Insumos
+        insumos = sorted(p.name for p in (pasta / INS_DIR).iterdir())
+        self.assertEqual(insumos, ["FUNDO ALFA FIDC_11111111000111_TRIMESTRAL_CVM.xlsx",
+                                   "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.xlsx"])
         self.assertFalse([a for a in arquivos if "GAMA" in a])
         self.assertIn("1 fundo(s) sem carteira", log)
         self.assertIn("1 CNPJ(s) repetido(s)", log)
@@ -391,7 +394,9 @@ class TestConferenciaCVM(Base):
         with redirect_stdout(log):
             g.main(["--config", str(config), "gerar"])
         raiz = sorted(p.name for p in (pasta / "saida").iterdir())
-        self.assertEqual(raiz, sorted([OK_DIR, REV_DIR, "resumo_geracao.csv"]))
+        self.assertEqual(raiz, sorted([OK_DIR, INS_DIR, REV_DIR, "resumo_geracao.csv"]))
+        self.assertTrue((pasta / "saida" / INS_DIR / "FUNDO ALFA FIDC_11111111000111_TRIMESTRAL_CVM.xlsx").exists())
+        self.assertFalse((pasta / "saida" / INS_DIR / "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.xlsx").exists())
         saida = sorted(p.name for p in (pasta / "saida" / OK_DIR).iterdir())
         rev = sorted(p.name for p in (pasta / "saida" / REV_DIR).iterdir())
         self.assertIn("FUNDO ALFA FIDC_11111111000111_TRIMESTRAL_CVM.pdf", saida)
