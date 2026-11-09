@@ -247,6 +247,39 @@ class TestComandoGerar(Base):
         resumo = (self.tmp / "saida_erro" / "resumo_geracao.csv").read_text(encoding="utf-8-sig")
         self.assertIn("ERRO ao gerar", resumo)
 
+    def test_avisa_fundo_da_carteira_fora_da_lista(self):
+        pasta = self.tmp / "fora"
+        shutil.copytree(self.tmp / "entrada", pasta / "entrada")
+        delta = "44.444.444/0001-44"
+        for arquivo, linha in (("carteira_informe.xlsx", [DATA_BASE, "44444444000144", "Disponibilidades", 50.0]),
+                               ("pipefy.xlsx", ["DELTA CARD", delta])):
+            wb = openpyxl.load_workbook(pasta / "entrada" / arquivo)
+            wb.active.append(linha)
+            wb.save(pasta / "entrada" / arquivo)
+        cfg = json.loads(self.config.read_text(encoding="utf-8"))
+        cfg["pastas"] = {"entrada": str(pasta / "entrada"), "saida": str(pasta / "saida"),
+                         "validados": str(pasta / "validados")}
+        config = pasta / "config.json"
+        config.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+
+        self.assertEqual(g.fundos_fora_da_lista(g.carregar_bases(g.ler_config(config))), [(delta, "DELTA CARD")])
+        saida = io.StringIO()
+        with redirect_stdout(saida):
+            g.main(["--config", str(config), "gerar", "--formato", "xlsx"])
+        log = saida.getvalue()
+        self.assertIn(f"[AVISO] 1 fundo(s) na Carteira Informe que não estão na lista de fundos", log)
+        self.assertIn(f"{delta} DELTA CARD", log)
+        self.assertIn("concluída: 2 fundo(s)", log)
+        self.assertFalse([p for p in (pasta / "saida").iterdir() if "44444444000144" in p.name])
+        resumo = (pasta / "saida" / "resumo_geracao.csv").read_text(encoding="utf-8-sig")
+        self.assertIn(f"DELTA CARD;{delta};;;NÃO GERADO", resumo)
+
+        # gerando só CNPJs escolhidos, não avisa
+        saida = io.StringIO()
+        with redirect_stdout(saida):
+            g.main(["--config", str(config), "gerar", "--formato", "xlsx", "--cnpj", ALFA])
+        self.assertNotIn("não estão na lista", saida.getvalue())
+
     def test_entrada_em_csv(self):
         pasta = self.tmp / "csv"
         shutil.copytree(self.tmp / "entrada", pasta / "entrada")

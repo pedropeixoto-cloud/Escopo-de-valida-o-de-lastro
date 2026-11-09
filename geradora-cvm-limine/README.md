@@ -65,6 +65,17 @@ Outro comando: `python geradora_cvm.py listar-validados` (antigo **Listar Verifi
 | IV e V. Textos | Primeira linha do Pipefy com o CNPJ do fundo; um campo vazio (ou fundo sem resposta) recebe `texto_gestor_sem_resposta` |
 | Quem é gerado | Todo fundo da lista que tem ao menos uma linha na Carteira Informe (coluna "Tem Informe?") |
 
+### Fundos novos e encerrados
+
+A lista de fundos (`fundos.xlsx`, antiga aba Setup) é mantida à mão.
+
+- **Fundo encerrado:** pode continuar na lista. Sem carteira no trimestre, ele não é gerado e aparece no
+  aviso `[INFO] N fundo(s) sem carteira na base, não gerados`.
+- **Fundo novo:** inclua uma linha com nome e CNPJ em `fundos.xlsx`. Se ele aparecer na Carteira Informe
+  e não estiver na lista, o `gerar` **não** gera o relatório, mas avisa com `[AVISO] … não estão na lista
+  de fundos` (com o CNPJ e o título do card do Pipefy, quando houver) e registra o fundo no
+  `resumo_geracao.csv` como "NÃO GERADO".
+
 ### Formatação: `assets/modelo_cvm.xlsx`
 
 O modelo é a própria aba CVM **salva pelo Excel** (só valores, sem vínculos externos): fontes,
