@@ -22,6 +22,7 @@ import geradora_cvm as g  # noqa: E402
 DATA_BASE = dt.date(2026, 9, 30)
 TEXTO_PADRAO = json.loads((Path(g.BASE_DIR) / "config.json").read_text(encoding="utf-8"))["texto_gestor_sem_resposta"]
 
+OK_DIR, REV_DIR = g.SUBPASTAS_PADRAO["revisados"], g.SUBPASTAS_PADRAO["revisao_humana"]
 ALFA, BETA, GAMA = "11.111.111/0001-11", "22.222.222/0001-22", "33.333.333/0001-33"
 
 
@@ -253,7 +254,7 @@ class TestComandoGerar(Base):
         codigo, log = self.gerar()
         self.assertEqual(codigo, 0, log)
         pasta = self.tmp / "saida"
-        arquivos = sorted(p.name for p in pasta.iterdir())
+        arquivos = sorted(p.name for p in (pasta / OK_DIR).iterdir())
         self.assertIn("FUNDO ALFA FIDC_11111111000111_TRIMESTRAL_CVM.pdf", arquivos)
         self.assertIn("FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.xlsx", arquivos)
         self.assertFalse([a for a in arquivos if "GAMA" in a])
@@ -263,12 +264,12 @@ class TestComandoGerar(Base):
         self.assertEqual([l.split(";")[1] for l in resumo[1:]], [ALFA, BETA])  # ordem da lista, sem repetição
 
     def test_um_fundo_com_erro_nao_para_o_lote(self):
-        bloqueio = self.tmp / "saida_erro" / "FUNDO ALFA FIDC_11111111000111_TRIMESTRAL_CVM.pdf"
+        bloqueio = self.tmp / "saida_erro" / OK_DIR / "FUNDO ALFA FIDC_11111111000111_TRIMESTRAL_CVM.pdf"
         bloqueio.mkdir(parents=True)          # uma pasta com o nome do PDF impede a gravação
         codigo, log = self.gerar("--saida", str(self.tmp / "saida_erro"))
         self.assertEqual(codigo, 1)
         self.assertIn("[ERRO] FUNDO ALFA FIDC", log)
-        self.assertTrue((self.tmp / "saida_erro" / "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.pdf").exists())
+        self.assertTrue((self.tmp / "saida_erro" / OK_DIR / "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.pdf").exists())
         resumo = (self.tmp / "saida_erro" / "resumo_geracao.csv").read_text(encoding="utf-8-sig")
         self.assertIn("ERRO ao gerar", resumo)
 
@@ -295,7 +296,7 @@ class TestComandoGerar(Base):
         self.assertIn(f"[AVISO] 1 fundo(s) na Carteira Informe que não estão na lista de fundos", log)
         self.assertIn(f"{delta} DELTA CARD", log)
         self.assertIn("concluída: 2 fundo(s)", log)
-        self.assertFalse([p for p in (pasta / "saida").iterdir() if "44444444000144" in p.name])
+        self.assertFalse([p for p in (pasta / "saida").rglob("*") if "44444444000144" in p.name])
         resumo = (pasta / "saida" / "resumo_geracao.csv").read_text(encoding="utf-8-sig")
         self.assertIn(f"DELTA CARD;{delta};;;;;NÃO GERADO", resumo)  # pl, arquivo, conferencia_cvm e pasta vazios
 
@@ -379,34 +380,36 @@ class TestConferenciaCVM(Base):
                                                 "TAB_III_A_VL_PAGAR": 10}})
         montar_informe_cvm(publicado / "inf_mensal_fidc_202609.zip", divergente)
         cfg = json.loads(self.config.read_text(encoding="utf-8"))
-        cfg["pastas"] = dict(cfg["pastas"], saida=str(pasta / "saida"), revisao=str(pasta / "rev"))
+        cfg["pastas"] = dict(cfg["pastas"], saida=str(pasta / "saida"))
         cfg["cvm"]["url"] = publicado.as_uri() + "/inf_mensal_fidc_{aaaamm}.zip"
         config = pasta / "config.json"
         config.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
-        # um BETA antigo no _DRAFT deve sair de lá
+        # um BETA antigo na raiz do _DRAFT deve sair de lá
         (pasta / "saida").mkdir(parents=True)
         (pasta / "saida" / "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.pdf").write_bytes(b"antigo")
         log = io.StringIO()
         with redirect_stdout(log):
             g.main(["--config", str(config), "gerar"])
-        saida = sorted(p.name for p in (pasta / "saida").iterdir())
-        rev = sorted(p.name for p in (pasta / "rev").iterdir())
+        raiz = sorted(p.name for p in (pasta / "saida").iterdir())
+        self.assertEqual(raiz, sorted([OK_DIR, REV_DIR, "resumo_geracao.csv"]))
+        saida = sorted(p.name for p in (pasta / "saida" / OK_DIR).iterdir())
+        rev = sorted(p.name for p in (pasta / "saida" / REV_DIR).iterdir())
         self.assertIn("FUNDO ALFA FIDC_11111111000111_TRIMESTRAL_CVM.pdf", saida)
         self.assertFalse([a for a in saida if "BETA" in a])
         self.assertIn("FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.pdf", rev)
         self.assertIn("FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.xlsx", rev)
         self.assertIn("[REVISAR] FUNDO BETA", log.getvalue())
-        csv_rev = (pasta / "rev" / "revisao_cvm.csv").read_text(encoding="utf-8-sig")
+        csv_rev = (pasta / "saida" / REV_DIR / "revisao_cvm.csv").read_text(encoding="utf-8-sig")
         self.assertIn(g.STATUS_CORRIGIDO, csv_rev)
         self.assertIn("Patrimônio Líquido", csv_rev)
-        ws = openpyxl.load_workbook(pasta / "rev" / "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.xlsx").active
+        ws = openpyxl.load_workbook(pasta / "saida" / REV_DIR / "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.xlsx").active
         self.assertEqual(ws["C20"].value, 90)
         self.assertEqual(ws["C19"].value, -10)
 
     def test_sem_cvm(self):
         pasta = self.tmp / "sem_cvm"
         cfg = json.loads(self.config.read_text(encoding="utf-8"))
-        cfg["pastas"] = dict(cfg["pastas"], saida=str(pasta / "saida"), revisao=str(pasta / "rev"))
+        cfg["pastas"] = dict(cfg["pastas"], saida=str(pasta / "saida"))
         cfg["cvm"]["url"] = (pasta / "nao_existe").as_uri() + "/{aaaamm}.zip"
         pasta.mkdir()
         config = pasta / "config.json"
@@ -414,7 +417,7 @@ class TestConferenciaCVM(Base):
         with redirect_stdout(io.StringIO()):
             g.main(["--config", str(config), "gerar", "--sem-cvm"])
         self.assertTrue((pasta / "saida" / "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.pdf").exists())
-        self.assertFalse((pasta / "rev").exists())
+        self.assertFalse((pasta / "saida" / REV_DIR).exists())
 
 
 if __name__ == "__main__":

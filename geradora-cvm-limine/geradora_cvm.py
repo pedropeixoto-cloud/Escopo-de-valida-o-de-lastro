@@ -1313,6 +1313,9 @@ LINHAS_CONFERIDAS = {
     20: "Patrimônio Líquido",
 }
 
+# Subpastas da pasta de saída (config.json -> "subpastas")
+SUBPASTAS_PADRAO = {"revisados": "Relatórios revisados", "revisao_humana": "Revisão humana"}
+
 STATUS_OK = "OK"
 STATUS_CORRIGIDO = "corrigido com a CVM"
 STATUS_INCONSISTENTE = "informe da CVM inconsistente"
@@ -1456,17 +1459,18 @@ def cmd_gerar(args, cfg):
     data_base = para_data(args.data_base or cfg["data_base"])
     saida = Path(args.saida) if args.saida else caminho_cfg(cfg, "saida")
     caminho_gravavel(saida).mkdir(parents=True, exist_ok=True)
-    informe, revisao = None, None
+    # Com a conferência da CVM, os arquivos vão para duas subpastas da saída:
+    # os que batem com o informe (revisados) e os que precisam de revisão humana.
+    informe, revisados, revisao = None, saida, None
     tolerancia = float(_cfg_cvm(cfg)["tolerancia"])
     if not args.sem_cvm:
         informe = ler_informe_cvm(baixar_informe_cvm(cfg, data_base), data_base)
-        if args.revisao:
-            revisao = Path(args.revisao)
-        elif "revisao" in cfg["pastas"]:
-            revisao = caminho_cfg(cfg, "revisao")
-        else:
-            revisao = saida.parent / "_REVISAO_HUMANA"
-        caminho_gravavel(revisao).mkdir(parents=True, exist_ok=True)
+        subpastas = {**SUBPASTAS_PADRAO, **cfg.get("subpastas", {})}
+        revisados = saida / subpastas["revisados"]
+        revisao = saida / subpastas["revisao_humana"]
+        for pasta in (revisados, revisao):
+            caminho_gravavel(pasta).mkdir(parents=True, exist_ok=True)
+    pastas_geradas = [p for p in {saida, revisados, revisao} if p is not None]
     modelo = carregar_modelo()
     rotulos = rotulos_composicao(modelo.ws)
     texto_padrao = cfg["texto_gestor_sem_resposta"]
@@ -1516,11 +1520,11 @@ def cmd_gerar(args, cfg):
                 rel.avisos.append("CNPJ não está na lista de fundos (nome em branco)")
             conf = conferir_cvm(rel, informe, tolerancia) if informe is not None else None
             revisar = bool(conf and conf.revisar)
-            destino, outra = (revisao, saida) if revisar else (saida, revisao)
+            destino = revisao if revisar else revisados
             for ext in sorted(formatos):
-                if outra is not None:  # se o fundo trocou de pasta desde a última geração, tira a cópia antiga
+                for outra in pastas_geradas:  # se o fundo trocou de pasta desde a última geração, tira a cópia antiga
                     antigo = outra / f"{rel.nome_arquivo}.{ext}"
-                    if antigo.is_file():
+                    if outra != destino and antigo.is_file():
                         antigo.unlink()
                 arquivo = destino / f"{rel.nome_arquivo}.{ext}"
                 if ext == "pdf":
@@ -1567,7 +1571,9 @@ def cmd_gerar(args, cfg):
     print(f"Resumo com avisos por fundo: {saida / 'resumo_geracao.csv'}")
     if revisao is not None:
         n_rev = len({r["cnpj"] for r in revisoes})
-        print(f"Conferência com a CVM: {n_rev} fundo(s) para revisão humana em {revisao} (detalhes em revisao_cvm.csv)")
+        n_ok = sum(1 for r in resumo if r.get("conferencia_cvm") == STATUS_OK)
+        print(f"Conferência com a CVM: {n_ok} fundo(s) batem com o informe em {revisados}")
+        print(f"                       {n_rev} fundo(s) para revisão humana em {revisao} (detalhes em revisao_cvm.csv)")
     if erros:
         print(f"[ERRO] {erros} fundo(s) não foram gerados; veja o resumo.")
         sys.exit(1)
@@ -1708,7 +1714,6 @@ def main(argv=None):
     g.add_argument("--validados", help="pasta com as validações por fundo (linhas 32-34; arquivo com o CNPJ no nome)")
     g.add_argument("--sem-cvm", action="store_true",
                    help="não confere com o Informe Mensal FIDC da CVM (tudo vai para a pasta de saída)")
-    g.add_argument("--revisao", help="pasta dos fundos que precisam de revisão humana (padrão: pastas.revisao)")
     g.set_defaults(func=cmd_gerar)
 
     p = sub.add_parser("pipefy", help="baixa o relatório do Pipefy para a pasta de entrada")

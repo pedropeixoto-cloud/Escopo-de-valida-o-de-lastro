@@ -4,8 +4,12 @@
   "pastas": {
       "entrada": "entrada",
       "saida": "G:\\Drives compartilhados\\Auditoria de Lastro – 2º Semestre – 2026\\3T2026\\LIMINE\\_DRAFT",
-      "validados": "G:\\Drives compartilhados\\Auditoria de Lastro – 2º Semestre – 2026\\3T2026\\LIMINE\\_Validados",
-      "revisao": "G:\\Drives compartilhados\\Auditoria de Lastro – 2º Semestre – 2026\\3T2026\\LIMINE\\_REVISAO_HUMANA"
+      "validados": "G:\\Drives compartilhados\\Auditoria de Lastro – 2º Semestre – 2026\\3T2026\\LIMINE\\_Validados"
+  },
+
+  "subpastas": {
+      "revisados": "Relatórios revisados",
+      "revisao_humana": "Revisão humana"
   },
 
   "cvm": {

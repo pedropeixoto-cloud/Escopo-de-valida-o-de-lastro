@@ -30,9 +30,16 @@ pip install -r requirements.txt
    ```bash
    python geradora_cvm.py gerar
    ```
-   Os arquivos saem em `pastas.saida` como `<FUNDO>_<CNPJ>_TRIMESTRAL_CVM.pdf/.xlsx`,
-   junto com um `resumo_geracao.csv` que traz o PL e os avisos de cada fundo. Se algum fundo
-   falhar, os demais são gerados, o erro vai para o resumo e o comando termina com código 1.
+   Os arquivos (`<FUNDO>_<CNPJ>_TRIMESTRAL_CVM.pdf/.xlsx`) saem em duas subpastas de `pastas.saida`
+   (veja a conferência com a CVM abaixo):
+   ```
+   _DRAFT\
+     resumo_geracao.csv        PL, conferência com a CVM e avisos de cada fundo
+     Relatórios revisados\     fundos que batem com o Informe Mensal da CVM
+     Revisão humana\           fundos que não batem + revisao_cvm.csv
+   ```
+   Se algum fundo falhar, os demais são gerados, o erro vai para o resumo e o comando termina
+   com código 1.
 
 ### Conferência automática com a CVM
 
@@ -52,14 +59,17 @@ compara cada linha do quadro I com o informe do fundo:
 
 | Resultado | O que acontece | Pasta |
 |---|---|---|
-| Todas as linhas batem (diferença ≤ `cvm.tolerancia`, R$ 1) | nada | `pastas.saida` (_DRAFT) |
-| Diverge e o informe fecha (ativo − passivo = PL) | o relatório é **corrigido com o valor da CVM** e os % são recalculados | `pastas.revisao` (_REVISAO_HUMANA) |
-| Diverge e o informe não fecha ou está zerado | mantém a carteira | `pastas.revisao` |
-| Fundo sem informe na CVM no mês | mantém a carteira | `pastas.revisao` |
+| Todas as linhas batem (diferença ≤ `cvm.tolerancia`, R$ 1) | nada | `Relatórios revisados` |
+| Diverge e o informe fecha (ativo − passivo = PL) | o relatório é **corrigido com o valor da CVM** e os % são recalculados | `Revisão humana` |
+| Diverge e o informe não fecha ou está zerado | mantém a carteira | `Revisão humana` |
+| Fundo sem informe na CVM no mês | mantém a carteira | `Revisão humana` |
+
+Os nomes das subpastas ficam em `subpastas` no `config.json`.
 
 O `revisao_cvm.csv` da pasta de revisão lista, por fundo, a linha, o valor da carteira, o valor da CVM
 e o que foi feito. O `resumo_geracao.csv` ganhou as colunas `conferencia_cvm` e `pasta`. Se um fundo muda
-de pasta entre uma geração e outra, a cópia antiga é apagada. Para gerar sem conferir, use `--sem-cvm`.
+de pasta entre uma geração e outra (inclusive da raiz do `_DRAFT`), a cópia antiga é apagada. Para gerar
+sem conferir, use `--sem-cvm`: os arquivos saem direto em `pastas.saida`, sem subpastas.
 
 **Passo 0 (opcional):** para aproveitar uma Geradora que já tem as bases coladas, rode:
 ```bash
@@ -77,8 +87,7 @@ atualiza a `data_base`.
 | `--saida <pasta>` | grava em outra pasta |
 | `--data-base 2026-12-31` | troca a data base sem mexer no config |
 | `--com-lastro` | exibe as seções II e III, que ficam ocultas na planilha |
-| `--sem-cvm` | não confere com o Informe Mensal da CVM (tudo vai para `pastas.saida`) |
-| `--revisao <pasta>` | grava os fundos para revisão em outra pasta |
+| `--sem-cvm` | não confere com o Informe Mensal da CVM (tudo vai para `pastas.saida`, sem subpastas) |
 | `--validados <pasta>` | preenche as linhas "analisados" (32 a 34) com o `.xlsx` cujo nome contém o CNPJ |
 
 Outro comando: `python geradora_cvm.py listar-validados` (antigo **Listar Verificação de Lastro**).
