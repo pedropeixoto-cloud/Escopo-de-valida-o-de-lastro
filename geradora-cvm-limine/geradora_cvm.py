@@ -13,29 +13,37 @@ Substitui a planilha "Geradora Limine - EMISSÃO EM LOTE.xlsb" e os macros dela:
     Veja o README.
 
 As regras de cálculo reproduzem as fórmulas da aba CVM célula a célula; os
-comentários "CVM!X" apontam a célula de origem.
+comentários "CVM!X" apontam a célula de origem. A formatação vem de
+assets/modelo_cvm.xlsx, que é a aba CVM salva pelo próprio Excel: o XLSX é esse
+arquivo com as células calculadas preenchidas, e o PDF é desenhado a partir da
+mesma grade (alturas, larguras, mesclagens e estilos), como o Excel imprime.
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import datetime as dt
+import io
 import json
+import math
 import os
+import posixpath
 import re
 import sys
 import time
 import urllib.request
+import zipfile
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 import openpyxl
 from openpyxl.cell.rich_text import CellRichText, TextBlock
+from openpyxl.utils import get_column_letter, range_boundaries
 
 BASE_DIR = Path(__file__).resolve().parent
-ASSETS = BASE_DIR / "assets"
-MODELO_XLSX = ASSETS / "modelo_cvm.xlsx"
-LOGO = ASSETS / "logo_limine.png"
+MODELO_XLSX = BASE_DIR / "assets" / "modelo_cvm.xlsx"
 
 # Linhas da aba CVM ocultas na planilha original (seções II e III).
 LINHAS_SECAO_LASTRO = range(22, 48)
@@ -55,6 +63,8 @@ TEXTOS_GESTOR = {
 }
 
 CARACTERES_INVALIDOS = '/\\:*?"<>|'
+XML_INVALIDO = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+DATA_ZERO_EXCEL = dt.date(1899, 12, 30)
 
 
 # --------------------------------------------------------------------------
@@ -118,6 +128,41 @@ def nome_arquivo_seguro(texto: str) -> str:
     return texto
 
 
+def numero_csv(texto: str):
+    """Converte o texto de uma célula de CSV em número quando ele é um número.
+
+    Aceita "1234.56", "1234,56" e "1.234,56". Não converte texto com zero à esquerda
+    (CNPJ só com dígitos, códigos) nem datas e CNPJ formatados.
+    """
+    t = texto.strip()
+    if not t or not re.fullmatch(r"-?[\d.,]+", t) or re.match(r"-?0\d", t):
+        return texto
+    if "," in t and "." in t:
+        t = t.replace(".", "").replace(",", ".") if t.rfind(",") > t.rfind(".") else t.replace(",", "")
+    elif t.count(",") == 1:
+        t = t.replace(",", ".")
+    elif t.count(",") > 1 or t.count(".") > 1:
+        t = t.replace(",", "").replace(".", "")
+    try:
+        valor = float(t)
+    except ValueError:
+        return texto
+    return int(valor) if valor.is_integer() and "." not in t else valor
+
+
+def caminho_gravavel(caminho: Path) -> Path:
+    """No Windows, usa o prefixo \\\\?\\ quando o caminho passa do limite de 260 caracteres."""
+    if os.name != "nt":
+        return caminho
+    texto = str(caminho)
+    if texto.startswith("\\\\?\\") or len(texto) < 240:
+        return caminho
+    texto = os.path.abspath(texto)
+    if texto.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + texto[2:])
+    return Path("\\\\?\\" + texto)
+
+
 def ler_config(caminho: Path) -> dict:
     with open(caminho, encoding="utf-8") as f:
         cfg = json.load(f)
@@ -148,6 +193,8 @@ def ler_tabela(caminho: Path, aba: str | None = None) -> list[dict]:
             f.seek(0)
             sep = ";" if amostra.count(";") > amostra.count(",") else ","
             linhas = list(csv.reader(f, delimiter=sep))
+        # no CSV tudo é texto; números viram números para entrar nas somas
+        linhas = linhas[:1] + [[numero_csv(v) for v in linha] for linha in linhas[1:]]
     elif ext == ".xlsb":
         from pyxlsb import open_workbook
 
@@ -196,6 +243,22 @@ class Bases:
     pipefy: list[dict]
     mapeamento: list[tuple[str, str]]
     avisos_gerais: list[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        # índices por CNPJ: cada fundo consulta só as próprias linhas
+        self.carteira_por_cnpj: dict[str, list[dict]] = defaultdict(list)
+        for linha in self.carteira:
+            self.carteira_por_cnpj[linha["cnpj"]].append(linha)
+        self.sinqia_por_doc: dict[int, list[dict]] = defaultdict(list)
+        for linha in self.sinqia:
+            if linha["doc"] is not None:
+                self.sinqia_por_doc[linha["doc"]].append(linha)
+        self.pipefy_por_cnpj: dict[str, dict] = {}
+        for linha in self.pipefy:  # FILTER devolve primeiro a linha de cima
+            self.pipefy_por_cnpj.setdefault(digitos(coluna(linha, "CNPJ do Fundo")), linha)
+        self.nome_por_cnpj: dict[str, str] = {}
+        for f in self.fundos:  # XLOOKUP devolve o primeiro da lista
+            self.nome_por_cnpj.setdefault(digitos(f["cnpj"]), f["nome"])
 
 
 def mapear_descricao(descricao, mapeamento) -> str:
@@ -301,22 +364,19 @@ class Relatorio:
 
     @property
     def nome_arquivo(self) -> str:
-        return nome_arquivo_seguro(f"{self.nome.strip()}_{digitos(self.cnpj)}_TRIMESTRAL_CVM")
+        # o Windows aceita até 255 caracteres por nome; nomes reais têm no máximo ~130
+        sufixo = f"_{digitos(self.cnpj)}_TRIMESTRAL_CVM"
+        return nome_arquivo_seguro(self.nome.strip()[:200 - len(sufixo)].rstrip() + sufixo)
 
 
 def tem_carteira(bases: Bases, cnpj: str) -> bool:
     """Setup!O / Setup!E: COUNTIF(CarteiraInforme!B:B, CNPJ) > 0."""
-    d = digitos(cnpj)
-    return any(l["cnpj"] == d for l in bases.carteira)
+    return digitos(cnpj) in bases.carteira_por_cnpj
 
 
 def nome_do_fundo(bases: Bases, cnpj: str) -> str:
     """Setup!C7 =XLOOKUP(cnpj, H:H, G:G): primeiro nome da lista com esse CNPJ."""
-    d = digitos(cnpj)
-    for f in bases.fundos:
-        if digitos(f["cnpj"]) == d:
-            return f["nome"]
-    return ""
+    return bases.nome_por_cnpj.get(digitos(cnpj), "")
 
 
 def calcular(bases: Bases, cnpj: str, data_base: dt.date, rotulos_composicao: dict,
@@ -333,29 +393,35 @@ def calcular(bases: Bases, cnpj: str, data_base: dt.date, rotulos_composicao: di
     c["B5"] = f"{numero_excel(data_base.month / 3)}º Trimestre/{data_base.year}"  # =MONTH(B6)/3&"º Trimestre/"&YEAR(B6)
     c["B6"] = data_base                                                # =Setup!$C$6
     c["A10"] = "A seguir segue a composição da Carteira em " + data_base.strftime("%d/%m/%Y")
+    c["G3"] = nome                                                     # =fundo (auxiliar, fora da impressão)
+    c["G4"] = cnpj_dig[:13]                                            # =LEFT(CNPJ sem pontuação, 13)
 
     # I. Composição da carteira
     # C13:C20 =SUMIFS(CarteiraInforme!D:D, G:G, rótulo, A:A, data base, B:B, CNPJ)
-    linhas_fundo = [l for l in bases.carteira if l["cnpj"] == cnpj_dig and l["data"] == data_base]
+    linhas_fundo = [l for l in bases.carteira_por_cnpj.get(cnpj_dig, ()) if l["data"] == data_base]
     if not linhas_fundo:
         avisos.append("Fundo sem linhas na Carteira Informe para a data base")
+    soma_cat: dict[str, float] = defaultdict(float)
+    for l in linhas_fundo:
+        soma_cat[norm(l["categoria"])] += l["valor"]
     for linha, rotulo in rotulos_composicao.items():
-        c[f"C{linha}"] = sum(l["valor"] for l in linhas_fundo if norm(l["categoria"]) == norm(rotulo))
+        c[f"C{linha}"] = soma_cat.get(norm(rotulo), 0)
     pl = c["C20"]
     for linha in range(13, 20):
         c[f"D{linha}"] = div(c[f"C{linha}"], pl)                       # =IFERROR(C13/$C$20,0%)
     c["D20"] = sum(c[f"D{l}"] for l in range(13, 20))                  # =SUM(D13:D19)
-    if pl and abs(sum(c[f"C{l}"] for l in range(13, 20)) - pl) > 0.01:
+    soma_linhas = sum(c[f"C{l}"] for l in range(13, 20))
+    if pl and abs(soma_linhas - pl) > 0.01:
         avisos.append("Soma das linhas da composição difere do Patrimônio Líquido "
-                      f"(soma={sum(c[f'C{l}'] for l in range(13, 20)):.2f}; PL={pl:.2f})")
-    outras = sorted({l["categoria"] for l in linhas_fundo if l["categoria"]
-                     and norm(l["categoria"]) not in {norm(r) for r in rotulos_composicao.values()}})
+                      f"(soma={soma_linhas:.2f}; PL={pl:.2f})")
+    no_quadro = {norm(r) for r in rotulos_composicao.values()}
+    outras = sorted({l["categoria"] for l in linhas_fundo if l["categoria"] and norm(l["categoria"]) not in no_quadro})
     if outras:
         avisos.append("Categorias da carteira que não aparecem no quadro: " + ", ".join(outras))
 
     # II. Verificação de lastro (Resumo Sinqia). G4 = LEFT(CNPJ sem pontuação, 13)
     doc = int(cnpj_dig[:13]) if cnpj_dig else None
-    sq = [l for l in bases.sinqia if l["doc"] is not None and l["doc"] == doc]
+    sq = bases.sinqia_por_doc.get(doc, ())
 
     def soma(campo, **filtro):
         return sum(l[campo] for l in sq if all(norm(l[k]) == norm(v) for k, v in filtro.items()))
@@ -395,9 +461,10 @@ def calcular(bases: Bases, cnpj: str, data_base: dt.date, rotulos_composicao: di
     c["E34"] = div(c["B34"], c["B30"]); c["F34"] = div(c["D34"], c["D30"])
 
     # IV/V. Textos do gestor: CVM!I5 =FILTER(Pipefy!A:W, Pipefy!B:B=CNPJ, "")
-    resposta = next((p for p in bases.pipefy if digitos(coluna(p, "CNPJ do Fundo")) == cnpj_dig), None)
+    resposta = bases.pipefy_por_cnpj.get(cnpj_dig)
     if resposta is None:
         avisos.append("Sem resposta do gestor no Pipefy: textos padrão usados")
+    c["I5"] = coluna(resposta, "Title") if resposta else None          # título do card (auxiliar)
     for linha, campo in TEXTOS_GESTOR.items():
         valor = coluna(resposta, campo) if resposta else None
         c[f"A{linha}"] = texto_padrao if valor in (None, "") else str(valor)   # =IF(K5="",$I$8,K5)
@@ -406,171 +473,787 @@ def calcular(bases: Bases, cnpj: str, data_base: dt.date, rotulos_composicao: di
 
 
 # --------------------------------------------------------------------------
-# saída XLSX (a partir do modelo com a formatação original da aba CVM)
+# modelo da aba CVM (assets/modelo_cvm.xlsx, salvo pelo Excel)
 # --------------------------------------------------------------------------
-def carregar_modelo():
-    return openpyxl.load_workbook(MODELO_XLSX, rich_text=True)
+RE_CELULA = re.compile(r'<c r="([A-Z]{1,3})(\d+)"([^>]*?)(?:/>|>(.*?)</c>)', re.S)
+RE_LINHA = re.compile(r'<row r="(\d+)"([^>]*?)(/?)>')
+
+
+def serial_excel(valor) -> float:
+    if isinstance(valor, dt.datetime):
+        return (valor - dt.datetime(1899, 12, 30)).total_seconds() / 86400
+    return float((valor - DATA_ZERO_EXCEL).days)
+
+
+def celula_xml(ref: str, estilo: str | None, valor) -> str:
+    s = f' s="{estilo}"' if estilo else ""
+    if valor is None or valor == "":
+        return f'<c r="{ref}"{s}/>'
+    if isinstance(valor, bool):
+        return f'<c r="{ref}"{s} t="b"><v>{int(valor)}</v></c>'
+    if isinstance(valor, dt.date):
+        valor = serial_excel(valor)
+    if isinstance(valor, (int, float)):
+        x = float(valor)
+        if not math.isfinite(x):
+            return f'<c r="{ref}"{s} t="e"><v>#NUM!</v></c>'
+        return f'<c r="{ref}"{s}><v>{int(x) if x.is_integer() else repr(x)}</v></c>'
+    texto = XML_INVALIDO.sub("", str(valor).replace("\r\n", "\n").replace("\r", "\n"))
+    return f'<c r="{ref}"{s} t="inlineStr"><is><t xml:space="preserve">{escape(texto)}</t></is></c>'
+
+
+def _coluna_num(letras: str) -> int:
+    n = 0
+    for ch in letras:
+        n = n * 26 + ord(ch) - 64
+    return n
+
+
+def _inserir_celula(xml: str, ref: str, valor) -> str:
+    """Cria a célula quando o modelo não tem o elemento <c> (por exemplo, sem formatação)."""
+    letras, linha = re.fullmatch(r"([A-Z]+)(\d+)", ref).groups()
+    nova = celula_xml(ref, None, valor)
+    m = re.search(rf'<row r="{linha}"([^>]*?)(/?)>', xml)
+    if m is None:
+        for outra in RE_LINHA.finditer(xml):
+            if int(outra.group(1)) > int(linha):
+                return xml[:outra.start()] + f'<row r="{linha}">{nova}</row>' + xml[outra.start():]
+        if "<sheetData/>" in xml:
+            return xml.replace("<sheetData/>", f'<sheetData><row r="{linha}">{nova}</row></sheetData>')
+        return xml.replace("</sheetData>", f'<row r="{linha}">{nova}</row></sheetData>')
+    attrs = re.sub(r'\s+spans="[^"]*"', "", m.group(1))
+    if m.group(2):  # <row .../>
+        return xml[:m.start()] + f'<row r="{linha}"{attrs}>{nova}</row>' + xml[m.end():]
+    fim = xml.index("</row>", m.end())
+    corpo = xml[m.end():fim]
+    pos = len(corpo)
+    for cel in RE_CELULA.finditer(corpo):
+        if _coluna_num(cel.group(1)) > _coluna_num(letras):
+            pos = cel.start()
+            break
+    return xml[:m.start()] + f'<row r="{linha}"{attrs}>' + corpo[:pos] + nova + corpo[pos:] + xml[fim:]
+
+
+class ModeloCVM:
+    """A aba CVM do modelo: o XLSX de saída é ele com as células calculadas preenchidas."""
+
+    def __init__(self, caminho: Path = MODELO_XLSX):
+        dados = Path(caminho).read_bytes()
+        with zipfile.ZipFile(io.BytesIO(dados)) as z:
+            self._infos = z.infolist()
+            self._partes = {i.filename: z.read(i.filename) for i in self._infos}
+        rid = re.search(r'<sheet [^>]*r:id="([^"]+)"', self._parte_txt("xl/workbook.xml")).group(1)
+        self._parte_aba = self._destino_rel("xl/workbook.xml", rid)
+        self._xml_aba = self._parte_txt(self._parte_aba)
+        self.ws = openpyxl.load_workbook(io.BytesIO(dados), rich_text=True).worksheets[0]
+        self._geometria = None
+        self._estilos: dict = {}
+        self.cache_linhas: dict = {}  # quebra de linha dos textos fixos, reaproveitada entre fundos
+
+    # ---- partes do pacote
+    def _parte_txt(self, nome: str) -> str:
+        return self._partes[nome].decode("utf-8")
+
+    def _destino_rel(self, parte: str, rid: str) -> str:
+        pasta, nome = posixpath.split(parte)
+        rels = self._parte_txt(posixpath.join(pasta, "_rels", nome + ".rels"))
+        for rel in re.findall(r"<Relationship\b[^>]*>", rels):
+            attrs = dict(re.findall(r'(\w+)="([^"]*)"', rel))
+            if attrs.get("Id") == rid:
+                alvo = attrs["Target"]
+                return alvo.lstrip("/") if alvo.startswith("/") else posixpath.normpath(posixpath.join(pasta, alvo))
+        raise KeyError(f"relacionamento {rid} não encontrado em {parte}")
+
+    def logo_cabecalho(self):
+        """Imagem do cabeçalho esquerdo (&G): (bytes, largura_pt, altura_pt) ou None."""
+        m = re.search(r'<legacyDrawingHF r:id="([^"]+)"', self._xml_aba)
+        if not m or "&G" not in (self.ws.oddHeader.left.text or ""):
+            return None
+        vml_parte = self._destino_rel(self._parte_aba, m.group(1))
+        vml = self._partes[vml_parte].decode("utf-8", "replace")
+        forma = re.search(r'<v:shape [^>]*id="LH".*?</v:shape>', vml, re.S)
+        if not forma:
+            return None
+        estilo = re.search(r"style='([^']*)'", forma.group(0)).group(1)
+        medida = dict(re.findall(r"(width|height):([\d.]+)pt", estilo))
+        rid_img = re.search(r'o:relid="([^"]+)"', forma.group(0)).group(1)
+        imagem = self._partes[self._destino_rel(vml_parte, rid_img)]
+        return imagem, float(medida["width"]), float(medida["height"])
+
+    # ---- XLSX
+    def xlsx(self, celulas: dict, mostrar_lastro: bool) -> bytes:
+        pendentes = dict(celulas)
+
+        def troca(m):
+            ref = m.group(1) + m.group(2)
+            if ref not in pendentes:
+                return m.group(0)
+            estilo = re.search(r'\ss="(\d+)"', m.group(3))
+            return celula_xml(ref, estilo.group(1) if estilo else None, pendentes.pop(ref))
+
+        xml = RE_CELULA.sub(troca, self._xml_aba)
+        for ref, valor in pendentes.items():
+            xml = _inserir_celula(xml, ref, valor)
+
+        marca_oculta = "" if mostrar_lastro else ' hidden="1"'
+
+        def oculta(m):
+            linha = int(m.group(1))
+            if linha not in LINHAS_SECAO_LASTRO:
+                return m.group(0)
+            attrs = re.sub(r'\s+hidden="(?:1|true)"', "", m.group(2))
+            return f'<row r="{linha}"{attrs}{marca_oculta}{m.group(3)}>'
+
+        xml = RE_LINHA.sub(oculta, xml)
+        buf = io.BytesIO()
+        agora = time.localtime()[:6]
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for info in self._infos:
+                dados = xml.encode("utf-8") if info.filename == self._parte_aba else self._partes[info.filename]
+                novo = zipfile.ZipInfo(info.filename, date_time=agora)
+                novo.compress_type = zipfile.ZIP_DEFLATED
+                z.writestr(novo, dados)
+        return buf.getvalue()
+
+    # ---- geometria de impressão (para o PDF)
+    @property
+    def geometria(self) -> "Geometria":
+        if self._geometria is None:
+            self._geometria = Geometria.do_modelo(self)
+        return self._geometria
+
+    def estilo(self, linha: int, col: int) -> "EstiloCelula":
+        chave = (linha, col)
+        if chave not in self._estilos:
+            self._estilos[chave] = EstiloCelula.da_celula(self.ws.cell(linha, col))
+        return self._estilos[chave]
+
+
+def carregar_modelo() -> ModeloCVM:
+    return ModeloCVM(MODELO_XLSX)
 
 
 def rotulos_composicao(ws) -> dict:
     return {linha: str(ws[f"B{linha}"].value).strip() for linha in range(13, 21)}
 
 
-def salvar_xlsx(rel: Relatorio, destino: Path, mostrar_lastro: bool) -> None:
-    wb = carregar_modelo()
-    ws = wb["CVM"]
-    for ref, valor in rel.celulas.items():
-        ws[ref].value = valor
-    for linha in LINHAS_SECAO_LASTRO:
-        ws.row_dimensions[linha].hidden = not mostrar_lastro
-    wb.save(destino)
+def salvar_xlsx(rel: Relatorio, destino: Path, mostrar_lastro: bool, modelo: ModeloCVM) -> None:
+    caminho_gravavel(destino).write_bytes(modelo.xlsx(rel.celulas, mostrar_lastro))
 
 
 # --------------------------------------------------------------------------
-# saída PDF (reportlab), imitando a impressão da aba CVM (A4, zoom 68%)
+# saída PDF: a aba CVM desenhada como o Excel imprime (A4, zoom da página)
 # --------------------------------------------------------------------------
-def fmt_contabil(v: float, casas: int = 2) -> str:
-    """Formato contábil da planilha: 1.234,56 / (1.234,56) / - para zero."""
-    if round(v, casas) == 0:
-        return "-"
-    s = f"{abs(v):,.{casas}f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    return f"({s})" if v < 0 else s
+# Calibração medida no PDF que o próprio Excel exporta desta aba (zoom 68%). O Excel não
+# aplica o zoom igual nos dois eixos: as colunas saem 7,5% e as linhas 1,6% maiores.
+AJUSTE_X = 0.73086 / 0.68
+AJUSTE_Y = 0.6906 / 0.68
+PX_DIGITO = 7              # largura do dígito da fonte Normal (Aptos Narrow 11), em pixels
+PASSO_FONTE = 72 / 600     # o Excel arredonda o corpo da fonte para pixels da impressora (600 dpi)
+DESLOCAMENTO_Y = 0.47      # a grade começa um pouco abaixo da margem superior
+# medidas de texto em pontos impressos a 68% (escalam com o zoom)
+MARGEM_TEXTO = 1.1         # entre a borda esquerda da célula e o texto
+MARGEM_DIREITA = 2.0       # entre o texto alinhado à direita e a borda direita
+RECUO_NIVEL = 6.2          # por nível de recuo
+BASE_INFERIOR = 2.3        # linha de base acima da borda de baixo (alinhamento inferior)
+# O texto impresso pelo Excel sai ~0,5% mais largo que as métricas da fonte e a área útil da
+# célula é um pouco menor: medido em 895 quebras de linha do Excel, ele quebra quando a linha
+# passa de 522-528 pt numa célula de 531 pt úteis.
+FATOR_QUEBRA = 0.99
+# medidas proporcionais ao corpo da fonte impresso
+ENTRELINHA = 1.257
+BASE_SUPERIOR = 0.97       # linha de base abaixo da borda de cima (alinhamento superior)
+BASE_CENTRO = 0.32         # linha de base abaixo do centro (alinhamento central)
+ESPESSURA_BORDA = {"hair": 0.3, "thin": 0.6, "medium": 1.2, "mediumDashed": 1.2, "mediumDashDot": 1.2,
+                   "mediumDashDotDot": 1.2, "slantDashDot": 1.2, "thick": 1.8, "double": 1.8}
+PAPEL = {1: (612.0, 792.0), 9: (595.2756, 841.8898)}  # carta, A4
 
 
-def fmt_pct(v: float) -> str:
-    return f"{v * 100:.2f}%".replace(".", ",")
+@dataclass
+class EstiloCelula:
+    fonte: str
+    tamanho: float
+    negrito: bool
+    italico: bool
+    cor: tuple | None
+    horizontal: str | None
+    vertical: str | None
+    quebra: bool
+    recuo: float
+    formato: str
+    bordas: tuple            # (esq, dir, cima, baixo): (estilo, cor) ou None
+    fundo: tuple | None
+
+    @staticmethod
+    def da_celula(cel) -> "EstiloCelula":
+        f, a, b = cel.font, cel.alignment, cel.border
+        bordas = tuple((lado.style, _cor(lado.color)) if lado is not None and lado.style else None
+                       for lado in (b.left, b.right, b.top, b.bottom))
+        fundo = _cor(cel.fill.fgColor) if cel.fill is not None and cel.fill.fill_type == "solid" else None
+        return EstiloCelula(f.name or "Arial", float(f.sz or 11), bool(f.b), bool(f.i), _cor(f.color),
+                            a.horizontal, a.vertical, bool(a.wrap_text), float(a.indent or 0),
+                            cel.number_format or "General", bordas, fundo)
 
 
-def texto_celula(valor) -> str:
-    """Converte texto (ou rich text do Excel) em marcação do reportlab."""
-    from xml.sax.saxutils import escape
+def _cor(cor) -> tuple | None:
+    """Cor RGB (0-1) de um objeto de cor do openpyxl; temas e índices viram preto/branco."""
+    if cor is None:
+        return None
+    try:
+        if cor.type == "rgb" and isinstance(cor.rgb, str) and len(cor.rgb) >= 6:
+            h = cor.rgb[-6:]
+            return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+        if cor.type == "theme":
+            return (1.0, 1.0, 1.0) if cor.theme in (0, 2) else (0.0, 0.0, 0.0)
+        if cor.type == "indexed":
+            return (1.0, 1.0, 1.0) if cor.indexed in (1, 9) else (0.0, 0.0, 0.0)
+    except (AttributeError, ValueError):
+        pass
+    return None
 
-    if valor is None:
-        return ""
+
+@dataclass
+class Geometria:
+    pagina: tuple[float, float]
+    margens: tuple[float, float, float, float]  # esquerda, direita, topo, base (pt)
+    margem_cabecalho: float
+    zoom: float
+    area: tuple[int, int, int, int]               # col1, lin1, col2, lin2
+    x_col: dict[int, float]                       # borda esquerda impressa da coluna
+    larg_col: dict[int, float]                    # largura impressa da coluna
+    alt_linha: dict[int, float]                   # altura da linha no Excel (pt, sem zoom)
+    ocultas: set[int]
+    quebras: set[int]                             # quebra manual depois destas linhas
+    mesclas: dict[tuple[int, int], tuple[int, int, int, int]]   # (lin, col) -> (l1, c1, l2, c2)
+    logo: tuple | None                            # (bytes, largura impressa, altura impressa)
+
+    @property
+    def sx(self) -> float:
+        return self.zoom * AJUSTE_X
+
+    @property
+    def sy(self) -> float:
+        return self.zoom * AJUSTE_Y
+
+    @staticmethod
+    def do_modelo(modelo: ModeloCVM) -> "Geometria":
+        ws, xml = modelo.ws, modelo._xml_aba
+        zoom = (ws.page_setup.scale or 100) / 100
+        papel = PAPEL.get(int(ws.page_setup.paperSize or 9), PAPEL[9])
+        if ws.page_setup.orientation == "landscape":
+            papel = (papel[1], papel[0])
+        pm = ws.page_margins
+        margens = tuple(72 * (v if v is not None else d) for v, d in
+                        ((pm.left, 0.7), (pm.right, 0.7), (pm.top, 0.75), (pm.bottom, 0.75)))
+        area_txt = (ws.print_area or ws.dimensions).split("!")[-1].replace("$", "")
+        area = range_boundaries(area_txt)
+
+        larguras = {}
+        for col in re.findall(r"<col\b[^>]*/>", xml):
+            a = dict(re.findall(r'(\w+)="([^"]*)"', col))
+            for c in range(int(a["min"]), int(a["max"]) + 1):
+                larguras[c] = float(a.get("width", 0))
+        padrao = re.search(r'defaultColWidth="([\d.]+)"', xml)
+        larg_padrao = float(padrao.group(1)) if padrao else 9.140625
+        sx = zoom * AJUSTE_X
+        larg_col = {c: round(larguras.get(c, larg_padrao) * PX_DIGITO) * 0.75 * sx
+                    for c in range(area[0], area[2] + 1)}
+        total = sum(larg_col.values())
+        x = margens[0]
+        if ws.print_options.horizontalCentered:
+            x += (papel[0] - margens[0] - margens[1] - total) / 2
+        x_col = {}
+        for c in range(area[0], area[2] + 1):
+            x_col[c] = x
+            x += larg_col[c]
+
+        alt_padrao = ws.sheet_format.defaultRowHeight or 15
+        alt_linha, ocultas = {}, set()
+        for r in range(area[1], area[3] + 1):
+            dim = ws.row_dimensions[r]
+            alt_linha[r] = dim.height if dim.height is not None else alt_padrao
+            if dim.hidden:
+                ocultas.add(r)
+
+        mesclas = {}
+        for m in ws.merged_cells.ranges:
+            for r in range(m.min_row, m.max_row + 1):
+                for c in range(m.min_col, m.max_col + 1):
+                    mesclas[(r, c)] = (m.min_row, m.min_col, m.max_row, m.max_col)
+
+        logo = modelo.logo_cabecalho()
+        if logo:
+            logo = (logo[0], logo[1] * sx, logo[2] * zoom * AJUSTE_Y)
+        return Geometria(papel, margens, 72 * (pm.header if pm.header is not None else 0.3), zoom, area,
+                         x_col, larg_col, alt_linha, ocultas, {b.id for b in ws.row_breaks.brk}, mesclas, logo)
+
+
+_FONTES: dict | None = None
+
+
+def _fontes() -> dict:
+    """Registra a Arial do Windows (a fonte do modelo); sem ela, usa Helvetica (mesmas métricas)."""
+    global _FONTES
+    if _FONTES is None:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+
+        sans = ("Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique")
+        pasta = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+        arquivos = ("arial.ttf", "arialbd.ttf", "ariali.ttf", "arialbi.ttf")
+        if all((pasta / a).exists() for a in arquivos):
+            try:
+                nomes = ("Arial", "Arial-Bold", "Arial-Italic", "Arial-BoldItalic")
+                for nome, arq in zip(nomes, arquivos):
+                    pdfmetrics.registerFont(TTFont(nome, str(pasta / arq)))
+                sans = nomes
+            except Exception:  # fonte corrompida ou inacessível: segue com Helvetica
+                pass
+        _FONTES = {"sans": sans,
+                   "serif": ("Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic"),
+                   "mono": ("Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique")}
+    return _FONTES
+
+
+def _fonte_pdf(nome: str, negrito: bool, italico: bool) -> str:
+    n = (nome or "").lower()
+    familia = ("serif" if any(k in n for k in ("times", "cambria", "georgia", "garamond", "book"))
+               else "mono" if any(k in n for k in ("courier", "consolas", "mono")) else "sans")
+    return _fontes()[familia][(1 if negrito else 0) + (2 if italico else 0)]
+
+
+def _corpo_impresso(tamanho: float, zoom: float) -> float:
+    return math.ceil(tamanho * zoom / PASSO_FONTE - 1e-6) * PASSO_FONTE
+
+
+def _milhar(inteiro: str) -> str:
+    grupos = []
+    while len(inteiro) > 3:
+        grupos.insert(0, inteiro[-3:])
+        inteiro = inteiro[:-3]
+    return ".".join([inteiro] + grupos)
+
+
+def formatar_numero(valor: float, formato: str) -> tuple[str, str]:
+    """Texto de um número no formato da célula (Excel pt-BR).
+
+    Devolve (texto, reserva): `reserva` são caracteres cuja largura o Excel deixa em branco à
+    direita (os "_)" e "?" do formato contábil), para alinhar os números como na planilha.
+    """
+    formato = formato or "General"
+    if formato in ("General", "@"):
+        return numero_excel(valor), ""
+    sem_literais = re.sub(r'"[^"]*"|\\.', "", formato).lower()
+    if re.search(r"[dmy]", sem_literais) and not re.search(r"[0#]", sem_literais):
+        return para_data(valor).strftime("%d/%m/%Y"), ""   # data guardada como número
+    secoes = re.split(r';(?=(?:[^"]*"[^"]*")*[^"]*$)', formato)
+    casas_m = re.search(r"0\.(0+)", secoes[0])
+    casas = len(casas_m.group(1)) if casas_m else 0
+    pct = "%" in secoes[0].replace('"%"', "")
+    exibido = round(valor * (100 if pct else 1), casas)
+    if exibido == 0 and len(secoes) >= 3:
+        secao, valor = secoes[2], 0.0
+    elif exibido < 0 and len(secoes) >= 2:
+        secao, valor = secoes[1], abs(valor)
+    else:
+        secao = secoes[0]
+        if exibido == 0:
+            valor = 0.0  # "0,00%", nunca "-0,00%"
+    texto, reserva = "", ""
+    i = 0
+    while i < len(secao):
+        ch = secao[i]
+        if ch == '"':
+            fim = secao.index('"', i + 1)
+            texto += reserva + secao[i + 1:fim]
+            reserva, i = "", fim + 1
+        elif ch == "\\" and i + 1 < len(secao):
+            texto += reserva + secao[i + 1]
+            reserva, i = "", i + 2
+        elif ch == "_" and i + 1 < len(secao):
+            if texto:
+                reserva += secao[i + 1]
+            i += 2
+        elif ch == "*":
+            i += 2
+        elif ch == "[":
+            i = secao.index("]", i) + 1
+        elif ch == "?":
+            reserva += "0"
+            i += 1
+        elif ch in "#0":
+            m = re.match(r"[#0,]+(\.[0#?]+)?", secao[i:])
+            corpo = m.group(0)
+            dec = len(m.group(1)) - 1 if m.group(1) else 0
+            n = abs(valor) * (100 if pct else 1)
+            if exibido < 0 and len(secoes) < 2:
+                texto += "-"
+            inteiro, _, frac = f"{n:.{dec}f}".partition(".")
+            if "," in corpo:
+                inteiro = _milhar(inteiro)
+            texto += reserva + inteiro + ("," + frac if dec else "")
+            reserva, i = "", i + len(corpo)
+        else:
+            texto += reserva + ch
+            reserva, i = "", i + 1
+    return texto.strip(), reserva
+
+
+def _trechos(valor, est: EstiloCelula, corpo: float, zoom: float) -> list[tuple[str, str, float]]:
+    """Valor da célula em trechos (texto, fonte do PDF, corpo impresso), respeitando o rich text."""
     if isinstance(valor, CellRichText):
-        partes = []
+        saida = []
         for bloco in valor:
             if isinstance(bloco, TextBlock):
-                t = escape(bloco.text)
-                partes.append(f"<b>{t}</b>" if bloco.font is not None and bloco.font.b else t)
+                f = bloco.font
+                neg = est.negrito if f is None or f.b is None else bool(f.b)
+                ita = est.italico if f is None or f.i is None else bool(f.i)
+                nome = f.rFont if f is not None and f.rFont else est.fonte
+                tam = _corpo_impresso(float(f.sz), zoom) if f is not None and f.sz else corpo
+                saida.append((bloco.text, _fonte_pdf(nome, neg, ita), tam))
             else:
-                partes.append(escape(str(bloco)))
-        txt = "".join(partes)
+                saida.append((str(bloco), _fonte_pdf(est.fonte, est.negrito, est.italico), corpo))
+        return saida
+    return [(str(valor), _fonte_pdf(est.fonte, est.negrito, est.italico), corpo)]
+
+
+def _quebrar_linhas(trechos, largura: float, medir) -> list[tuple[list, float, bool]]:
+    """Quebra o texto em linhas de até `largura` pt, como a quebra automática do Excel.
+
+    Cada linha é (tokens, largura, fim_de_paragrafo); token = (texto, fonte, corpo, largura).
+    """
+    linhas = []
+    atual: list = []
+    larg = 0.0
+
+    def fechar(fim_paragrafo):
+        nonlocal atual, larg
+        while atual and atual[-1][0].isspace():
+            larg -= atual.pop()[3]
+        linhas.append((atual, larg, fim_paragrafo))
+        atual, larg = [], 0.0
+
+    for texto, fonte, corpo in trechos:
+        for tok in re.findall(r"\n|[^\S\n]+|\S+", texto):
+            if tok == "\n":
+                fechar(True)
+                continue
+            w = medir(tok, fonte, corpo)
+            if tok.isspace():
+                if atual:
+                    atual.append((tok, fonte, corpo, w))
+                    larg += w
+                continue
+            if larg + w > largura + 0.01 and any(not t[0].isspace() for t in atual):
+                fechar(False)
+            if w > largura:  # palavra maior que a linha: quebra entre caracteres
+                for ch in tok:
+                    wc = medir(ch, fonte, corpo)
+                    if larg + wc > largura + 0.01 and atual:
+                        fechar(False)
+                    atual.append((ch, fonte, corpo, wc))
+                    larg += wc
+                continue
+            atual.append((tok, fonte, corpo, w))
+            larg += w
+    fechar(True)
+    return linhas
+
+
+@dataclass
+class _Texto:
+    l1: int
+    l2: int
+    c1: int
+    c2: int
+    linhas: list
+    horizontal: str
+    vertical: str
+    recuo: float
+    reserva: float
+    corpo: float
+    justificar: bool
+    cor: tuple | None
+    vazias_fim: int = 0      # linhas em branco no fim do texto (o Excel as considera ao alinhar)
+
+
+def _preparar_textos(rel: Relatorio, modelo: ModeloCVM, alturas: dict, cache: dict) -> list[_Texto]:
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    g = modelo.geometria
+    c1, _, c2, _ = g.area
+    k = g.zoom / 0.68
+    margens = (MARGEM_TEXTO + MARGEM_DIREITA) * k
+
+    def valor(r, c):
+        ref = f"{get_column_letter(c)}{r}"
+        return rel.celulas[ref] if ref in rel.celulas else modelo.ws.cell(r, c).value
+
+    def vazia(r, c):
+        v = valor(r, c)
+        return (v is None or (isinstance(v, str) and not v.strip())) and (r, c) not in g.mesclas
+
+    textos = []
+    for r in alturas:
+        for c in range(c1, c2 + 1):
+            mescla = g.mesclas.get((r, c))
+            if mescla and (mescla[0], mescla[1]) != (r, c):
+                continue
+            v = valor(r, c)
+            if v is None or (isinstance(v, str) and not v.strip()):
+                continue
+            est = modelo.estilo(r, c)
+            corpo = _corpo_impresso(est.tamanho, g.zoom)
+            numero = isinstance(v, (int, float)) and not isinstance(v, bool)
+            reserva = ""
+            if numero:
+                texto, reserva = formatar_numero(float(v), est.formato)
+                trechos = [(texto, _fonte_pdf(est.fonte, est.negrito, est.italico), corpo)]
+            elif isinstance(v, (dt.date, dt.datetime)):
+                trechos = [(v.strftime("%d/%m/%Y"), _fonte_pdf(est.fonte, est.negrito, est.italico), corpo)]
+            else:
+                if isinstance(v, str):  # mantém as quebras de linha finais, como o Excel
+                    v = XML_INVALIDO.sub("", v.replace("\r\n", "\n").replace("\r", "\n")).lstrip().rstrip(" \t")
+                trechos = _trechos(v, est, corpo, g.zoom)
+            h = est.horizontal or "general"
+            if h == "general":
+                h = "right" if numero or isinstance(v, (dt.date, dt.datetime)) else "left"
+            quebra = (est.quebra or h in ("justify", "distributed")) and not numero
+            l1, ca, l2, cb = mescla or (r, c, r, c)
+            if not quebra and not mescla:
+                largura_txt = sum(stringWidth(t, f, s) for t, f, s in trechos)
+                ca, cb = _transbordar(r, c, h, largura_txt + margens, g, vazia)
+            recuo = est.recuo * RECUO_NIVEL * k
+            largura = sum(g.larg_col[x] for x in range(ca, cb + 1)) - margens - recuo
+            larg_reserva = stringWidth(reserva, trechos[0][1], corpo) if reserva else 0.0
+            chave = (r, c, repr(trechos), round(largura, 2), quebra)
+            em_cache = cache.get(chave)
+            if em_cache is None:
+                vazias = 0
+                if quebra:
+                    linhas = _quebrar_linhas(trechos, largura * FATOR_QUEBRA, stringWidth)
+                    while len(linhas) > 1 and not linhas[-1][0]:
+                        linhas.pop()
+                        vazias += 1
+                else:
+                    plano = [(t.replace("\n", " "), f, s) for t, f, s in trechos]
+                    linhas = _quebrar_linhas(plano, float("inf"), stringWidth)
+                    excesso = linhas[0][1] + larg_reserva - largura
+                    if excesso > 0.01:  # não cabe e não pode transbordar: reduz a fonte até caber
+                        fator = (largura - larg_reserva) / linhas[0][1]
+                        linhas = [([(t, f, s * fator, w * fator) for t, f, s, w in linhas[0][0]],
+                                   linhas[0][1] * fator, True)]
+                em_cache = cache[chave] = (linhas, vazias)
+            linhas, vazias = em_cache
+            textos.append(_Texto(l1, l2, ca, cb, linhas, h, est.vertical or "bottom", recuo, larg_reserva,
+                                 max((t[2] for ln in linhas for t in ln[0]), default=corpo),
+                                 h in ("justify", "distributed"), est.cor, vazias))
+    return textos
+
+
+def _transbordar(r, c, h, largura, g: Geometria, vazia) -> tuple[int, int]:
+    """Colunas ocupadas por um texto sem quebra: ele invade as vizinhas vazias, como no Excel."""
+    c1, _, c2, _ = g.area
+    ca = cb = c
+    if h == "centerContinuous":
+        while cb < c2 and vazia(r, cb + 1):
+            cb += 1
+        return ca, cb
+    ocupada = g.larg_col[c]
+    while ocupada < largura:
+        if h in ("left", "fill") and cb < c2 and vazia(r, cb + 1):
+            cb += 1
+            ocupada += g.larg_col[cb]
+        elif h == "right" and ca > c1 and vazia(r, ca - 1):
+            ca -= 1
+            ocupada += g.larg_col[ca]
+        elif h == "center" and ((cb < c2 and vazia(r, cb + 1)) or (ca > c1 and vazia(r, ca - 1))):
+            if cb < c2 and vazia(r, cb + 1):
+                cb += 1
+                ocupada += g.larg_col[cb]
+            if ocupada < largura and ca > c1 and vazia(r, ca - 1):
+                ca -= 1
+                ocupada += g.larg_col[ca]
+        else:
+            break
+    return ca, cb
+
+
+def salvar_pdf(rel: Relatorio, destino: Path, mostrar_lastro: bool, modelo: ModeloCVM) -> None:
+    from reportlab import rl_config
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen.canvas import Canvas
+
+    rl_config.useA85 = 0  # fluxos binários: sem a codificação ASCII85 (lenta em Python puro)
+
+    g = modelo.geometria
+    larg_pag, alt_pag = g.pagina
+    col1, lin1, col2, lin2 = g.area
+    k = g.zoom / 0.68
+
+    # 1) linhas visíveis, com a altura impressa
+    alturas = {}
+    for r in range(lin1, lin2 + 1):
+        if r in g.ocultas and not (mostrar_lastro and r in LINHAS_SECAO_LASTRO):
+            continue
+        alturas[r] = g.alt_linha[r] * g.sy
+
+    # 2) textos; a linha cresce quando o texto quebrado não cabe (o Excel cortaria o texto)
+    textos = _preparar_textos(rel, modelo, alturas, modelo.cache_linhas)
+
+    def altura_necessaria(linhas: int, corpo: float) -> float:
+        return (linhas - 1) * ENTRELINHA * corpo + 0.905 * corpo + (BASE_INFERIOR + 0.5) * k
+
+    for t in textos:
+        if len(t.linhas) + t.vazias_fim <= 1:
+            continue
+        visiveis = [r for r in range(t.l1, t.l2 + 1) if r in alturas]
+        disponivel = sum(alturas[r] for r in visiveis)
+        if t.vazias_fim and altura_necessaria(len(t.linhas) + t.vazias_fim, t.corpo) > disponivel:
+            t.vazias_fim = 0  # as linhas em branco não cabem: o Excel cortaria o texto; ignora
+        falta = altura_necessaria(len(t.linhas), t.corpo) - disponivel
+        if falta > 0 and visiveis:
+            alturas[visiveis[-1]] += falta
+
+    # 3) paginação: quebras manuais do modelo e automáticas; células mescladas não se dividem
+    fim_mescla = {}
+    for (r, c), (l1, _, l2, _) in g.mesclas.items():
+        if r == l1:
+            fim_mescla[r] = max(fim_mescla.get(r, r), l2)
+    topo = g.margens[2] + DESLOCAMENTO_Y * k
+    limite = alt_pag - g.margens[3]
+    paginas: list[list[int]] = [[]]
+    pos: dict[int, tuple[int, float]] = {}
+    y, protegido_ate = topo, 0
+    visiveis = list(alturas)
+    for i, r in enumerate(visiveis):
+        if r > protegido_ate:
+            fim = fim_mescla.get(r, r)
+            bloco = sum(alturas[x] for x in range(r, fim + 1) if x in alturas)
+            if y + bloco > limite + 0.01 and paginas[-1]:
+                paginas.append([])
+                y = topo
+            protegido_ate = fim
+        pos[r] = (len(paginas) - 1, y)
+        paginas[-1].append(r)
+        y += alturas[r]
+        if r in g.quebras and i < len(visiveis) - 1:
+            paginas.append([])
+            y = topo
+    paginas = [p for p in paginas if p]
+    pagina_de = {r: n for n, linhas in enumerate(paginas) for r in linhas}
+
+    # 4) desenho
+    cv = Canvas(str(destino), pagesize=(larg_pag, alt_pag), pageCompression=1)
+    cv.setTitle(f"Demonstrativo Trimestral - {rel.nome}")
+    cv.setAuthor("Limine Trust DTVM Ltda.")
+    logo = None
+    if g.logo:
+        logo = (ImageReader(io.BytesIO(g.logo[0])), g.logo[1], g.logo[2])
+
+    def caixa(l1, c1_, l2, c2_):
+        x0 = g.x_col[c1_]
+        x1 = g.x_col[c2_] + g.larg_col[c2_]
+        y0 = pos[l1][1]
+        ult = max(x for x in range(l1, l2 + 1) if x in alturas)
+        return x0, y0, x1, pos[ult][1] + alturas[ult]
+
+    for n, linhas in enumerate(paginas):
+        if logo:
+            cv.drawImage(logo[0], g.margens[0], alt_pag - g.margem_cabecalho - logo[2],
+                         width=logo[1], height=logo[2], mask="auto")
+        # fundos
+        for r in linhas:
+            for c in range(col1, col2 + 1):
+                est = modelo.estilo(r, c)
+                if est.fundo:
+                    cv.setFillColorRGB(*est.fundo)
+                    cv.rect(g.x_col[c], alt_pag - pos[r][1] - alturas[r], g.larg_col[c], alturas[r],
+                            stroke=0, fill=1)
+        # textos
+        for t in textos:
+            if pagina_de.get(t.l1) != n:
+                continue
+            x0, y0, x1, y1 = caixa(t.l1, t.c1, t.l2, t.c2)
+            _desenhar_texto(cv, t, x0, y0, x1, y1, alt_pag, k)
+        # bordas
+        for r in linhas:
+            for c in range(col1, col2 + 1):
+                est = modelo.estilo(r, c)
+                if not any(est.bordas):
+                    continue
+                m = g.mesclas.get((r, c))
+                x0, x1 = g.x_col[c], g.x_col[c] + g.larg_col[c]
+                y0, y1 = alt_pag - pos[r][1], alt_pag - pos[r][1] - alturas[r]
+                lados = ((est.bordas[0], (x0, y0, x0, y1), m and c > m[1]),
+                         (est.bordas[1], (x1, y0, x1, y1), m and c < m[3]),
+                         (est.bordas[2], (x0, y0, x1, y0), m and r > m[0]),
+                         (est.bordas[3], (x0, y1, x1, y1), m and r < m[2]))
+                for borda, (xa, ya, xb, yb), interna in lados:
+                    if borda and not interna:
+                        estilo, cor = borda
+                        espessura = ESPESSURA_BORDA.get(estilo, 0.6) * k
+                        if xa == xb:  # o Excel desenha a linha vertical por dentro da borda esquerda
+                            xa = xb = xa - espessura / 2
+                        cv.setLineWidth(espessura)
+                        cv.setStrokeColorRGB(*(cor or (0, 0, 0)))
+                        if "dash" in estilo.lower() or "dot" in estilo.lower():
+                            cv.setDash(2 * k, 2 * k)
+                        else:
+                            cv.setDash()
+                        cv.line(xa, ya, xb, yb)
+        cv.showPage()
+    cv.save()
+
+
+def _desenhar_texto(cv, t: _Texto, x0, y0, x1, y1, alt_pag, k) -> None:
+    """Desenha o texto na caixa (coordenadas a partir do topo da página)."""
+    n = len(t.linhas) + t.vazias_fim
+    passo = ENTRELINHA * t.corpo
+    if t.vertical == "top":
+        base = y0 + BASE_SUPERIOR * t.corpo
+    elif t.vertical in ("center", "justify", "distributed"):
+        base = (y0 + y1) / 2 + BASE_CENTRO * t.corpo - (n - 1) * passo / 2
     else:
-        txt = escape(str(valor))
-    return txt.strip().replace("\n", "<br/>")
-
-
-def salvar_pdf(rel: Relatorio, destino: Path, mostrar_lastro: bool) -> None:
-    from reportlab.lib import colors
-    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import ParagraphStyle
-    from reportlab.platypus import (PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table,
-                                    TableStyle)
-
-    ws = carregar_modelo()["CVM"]
-
-    def v(ref):
-        return rel.celulas.get(ref, ws[ref].value)
-
-    escala = 0.68                       # zoom de impressão da aba
-    f11, f10 = 11 * escala, 10 * escala
-    linha = 13.8 * escala               # altura padrão de linha
-    margem_lat, margem_vert = 28.35, 85.04
-    largura_util = A4[0] - 2 * margem_lat
-    larg_col = [35.55, 30.66, 17.55, 15.11, 12.55, 27.22]  # larguras A:F (caracteres)
-    total = sum(larg_col)
-    W = [largura_util * w / total for w in larg_col]
-    azul = colors.HexColor("#DEEAF6")
-
-    normal = ParagraphStyle("n", fontName="Helvetica", fontSize=f11, leading=f11 * 1.25)
-    just = ParagraphStyle("j", parent=normal, alignment=TA_JUSTIFY)
-    negrito = ParagraphStyle("b", parent=normal, fontName="Helvetica-Bold")
-    titulo = ParagraphStyle("t", parent=negrito, alignment=TA_CENTER)
-    recuo = ParagraphStyle("i", parent=just, leftIndent=f11 * 0.9)
-    cel = ParagraphStyle("c", fontName="Helvetica", fontSize=f10, leading=f10 * 1.2)
-    cel_b = ParagraphStyle("cb", parent=cel, fontName="Helvetica-Bold")
-    cel_bc = ParagraphStyle("cbc", parent=cel_b, alignment=TA_CENTER)
-
-    def esp(n=1):
-        return Spacer(1, linha * n)
-
-    def p(ref, estilo=just):
-        return Paragraph(texto_celula(v(ref)), estilo)
-
-    story = [p("A1", titulo), esp()]
-
-    # Cabeçalho (A3:F6)
-    cab = [[Paragraph(texto_celula(v(f"A{r}")), cel_b),
-            Paragraph(v(f"B{r}").strftime("%d/%m/%Y") if r == 6 else texto_celula(v(f"B{r}")),
-                      ParagraphStyle("r", parent=cel_b, alignment=2))] for r in range(3, 7)]
-    t = Table(cab, colWidths=[W[0], sum(W[1:])], rowHeights=linha)
-    t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-                           ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                           ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 1)]))
-    story += [t, esp(), p("A8", negrito), esp(), p("A10", normal), esp()]
-
-    # Quadro de composição (B12:D20)
-    dados = [[Paragraph(texto_celula(v(f"{c}12")), cel_bc) for c in "BCD"]]
-    for r in range(13, 21):
-        estilo = cel_b if r == 20 else cel
-        dados.append([Paragraph(texto_celula(v(f"B{r}")), estilo),
-                      Paragraph(fmt_contabil(v(f"C{r}")), ParagraphStyle("x", parent=cel, alignment=2)),
-                      Paragraph(fmt_pct(v(f"D{r}")), ParagraphStyle("y", parent=estilo, alignment=2))])
-    t = Table(dados, colWidths=W[1:4], rowHeights=linha)
-    t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-                           ("BACKGROUND", (0, 0), (-1, 0), azul),
-                           ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                           ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 1)]))
-    tabela = Table([["", t]], colWidths=[W[0], sum(W[1:])])
-    tabela.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
-    story += [tabela, esp()]
-
-    if mostrar_lastro:
-        def quadro(r_cab, r_ini, r_fim):
-            d = [[Paragraph(texto_celula(v(f"{c}{r_cab}")), cel_bc if c != "A" else cel_b) for c in "ABCDEF"]]
-            for r in range(r_ini, r_fim + 1):
-                bold = r == 29
-                d.append([Paragraph(texto_celula(v(f"A{r}")), cel_b if bold else cel)]
-                         + [Paragraph(fmt_contabil(num(v(f"B{r}")), 0 if r_cab == 26 else 2),
-                                      ParagraphStyle("q", parent=cel, alignment=2))]
-                         + [Paragraph(fmt_contabil(num(v(f"{c}{r}"))), ParagraphStyle("q", parent=cel, alignment=2))
-                            for c in "CD"]
-                         + [Paragraph(fmt_pct(num(v(f"{c}{r}"))) if r_cab == 26 else fmt_contabil(num(v(f"{c}{r}"))),
-                                      ParagraphStyle("q", parent=cel_b if bold else cel, alignment=2)) for c in "EF"])
-            tq = Table(d, colWidths=W)
-            tq.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-                                    ("BACKGROUND", (0, 0), (-1, 0), azul),
-                                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
-            return tq
-        story += [p("A22", negrito), esp(), p("A24", normal), esp(), quadro(26, 27, 36), esp(2),
-                  p("A39", negrito), esp(), p("A41", normal), esp(), quadro(43, 44, 46), esp()]
-
-    story += [p("A48", negrito), esp(), p("A50", normal), esp(), p("A52"), esp(2),
-              p("A55", negrito), esp(), p("A57"), esp(), p("A59"), esp(),
-              p("A60"), esp(), p("A63", recuo), esp(), p("A66"), esp(2),
-              p("A69", recuo), esp(), p("A72"), esp(2),
-              p("A75"), esp(), p("A77"), esp(2),
-              p("A80"), esp(), p("A82", recuo), esp(), p("A84"), esp(2),
-              p("A87", recuo), esp(), p("A89"), esp(),
-              PageBreak(),                                            # quebra manual da planilha
-              p("A92"), esp(), p("A94"), esp(2),
-              p("A97"), esp(), p("A100"), esp(2),
-              p("A103"), esp(), p("A106"), esp(2),
-              p("A109"), esp(), p("A112"), esp(3),
-              p("A116", negrito)]
-
-    def cabecalho(canvas, doc):
-        if LOGO.exists():
-            canvas.drawImage(str(LOGO), margem_lat, A4[1] - 28.35 - 30 * escala * 1.4,
-                             width=102.6 * escala * 1.4, height=30 * escala * 1.4,
-                             preserveAspectRatio=True, mask="auto")
-
-    doc = SimpleDocTemplate(str(destino), pagesize=A4, leftMargin=margem_lat, rightMargin=margem_lat,
-                            topMargin=margem_vert, bottomMargin=margem_vert,
-                            title=f"Demonstrativo Trimestral - {rel.nome}", author="Limine Trust DTVM Ltda.")
-    doc.build(story, onFirstPage=cabecalho, onLaterPages=cabecalho)
+        base = y1 - BASE_INFERIOR * k - (n - 1) * passo
+    cv.setFillColorRGB(*(t.cor or (0, 0, 0)))
+    esq = x0 + MARGEM_TEXTO * k + (t.recuo if t.horizontal in ("left", "justify", "distributed") else 0)
+    dir_ = x1 - MARGEM_DIREITA * k - (t.recuo if t.horizontal == "right" else 0) - t.reserva
+    for i, (tokens, largura, fim_paragrafo) in enumerate(t.linhas):
+        y = alt_pag - (base + i * passo)
+        extra = 0.0
+        if t.horizontal in ("right",):
+            x = dir_ - largura
+        elif t.horizontal in ("center", "centerContinuous"):
+            x = (x0 + x1 - largura - t.reserva) / 2
+        else:
+            x = esq
+            if t.justificar and not fim_paragrafo:
+                espacos = sum(len(tok[0]) for tok in tokens if tok[0].isspace())
+                if espacos:
+                    extra = max(0.0, (dir_ - esq - largura) / espacos)
+        if extra:
+            for texto, fonte, corpo, w in tokens:
+                if texto.isspace():
+                    x += w + extra * len(texto)
+                    continue
+                cv.setFont(fonte, corpo)
+                cv.drawString(x, y, texto)
+                x += w
+            continue
+        # junta os tokens de mesma fonte num único trecho
+        grupo, fonte_g, corpo_g, inicio = "", None, None, x
+        for texto, fonte, corpo, w in tokens:
+            if (fonte, corpo) != (fonte_g, corpo_g):
+                if grupo:
+                    cv.setFont(fonte_g, corpo_g)
+                    cv.drawString(inicio, y, grupo)
+                grupo, fonte_g, corpo_g, inicio = "", fonte, corpo, x
+            grupo += texto
+            x += w
+        if grupo:
+            cv.setFont(fonte_g, corpo_g)
+            cv.drawString(inicio, y, grupo)
 
 
 # --------------------------------------------------------------------------
@@ -582,9 +1265,9 @@ def cmd_gerar(args, cfg):
         print(f"[AVISO] {a}")
     data_base = para_data(args.data_base or cfg["data_base"])
     saida = Path(args.saida) if args.saida else caminho_cfg(cfg, "saida")
-    saida.mkdir(parents=True, exist_ok=True)
-    ws = carregar_modelo()["CVM"]
-    rotulos = rotulos_composicao(ws)
+    caminho_gravavel(saida).mkdir(parents=True, exist_ok=True)
+    modelo = carregar_modelo()
+    rotulos = rotulos_composicao(modelo.ws)
     texto_padrao = cfg["texto_gestor_sem_resposta"]
     formatos = {"pdf", "xlsx"} if args.formato == "ambos" else {args.formato}
 
@@ -596,32 +1279,54 @@ def cmd_gerar(args, cfg):
         pulados = [f["nome"] or f["cnpj"] for f in bases.fundos if not tem_carteira(bases, f["cnpj"])]
         if pulados:
             print(f"[INFO] {len(pulados)} fundo(s) sem carteira na base, não gerados: " + "; ".join(pulados))
+    unicos, vistos = [], set()
+    for c in alvo:  # 1ª ocorrência de cada CNPJ, na ordem da lista
+        if digitos(c) not in vistos:
+            vistos.add(digitos(c))
+            unicos.append(c)
+    if len(unicos) < len(alvo):
+        print(f"[INFO] {len(alvo) - len(unicos)} CNPJ(s) repetido(s) na lista; cada fundo é gerado uma vez")
+    alvo = unicos
 
     pasta_validados = Path(args.validados) if args.validados else None
-    resumo = []
+    validados = list(pasta_validados.glob("*.xlsx")) if pasta_validados else []
+    resumo, erros = [], 0
+    inicio = time.perf_counter()
     for cnpj in alvo:
-        validacao = None
-        if pasta_validados:
-            achados = [p for p in pasta_validados.glob("*.xlsx") if digitos(cnpj) in digitos(p.stem)]
+        rel = None
+        try:
+            validacao = None
+            achados = [p for p in validados if digitos(cnpj) in digitos(p.stem)]
             if achados:
                 validacao = ler_validacao(achados[0])
-        rel = calcular(bases, cnpj, data_base, rotulos, texto_padrao, validacao)
-        if not rel.nome:
-            rel.avisos.append("CNPJ não está na lista de fundos (nome em branco)")
-        if "pdf" in formatos:
-            salvar_pdf(rel, saida / f"{rel.nome_arquivo}.pdf", args.com_lastro)
-        if "xlsx" in formatos:
-            salvar_xlsx(rel, saida / f"{rel.nome_arquivo}.xlsx", args.com_lastro)
-        print(f"[OK] {rel.nome_arquivo}" + (f"  ({len(rel.avisos)} aviso(s))" if rel.avisos else ""))
-        resumo.append({"fundo": rel.nome, "cnpj": rel.cnpj, "pl": rel.celulas["C20"],
-                       "arquivo": rel.nome_arquivo, "avisos": " | ".join(rel.avisos)})
+            rel = calcular(bases, cnpj, data_base, rotulos, texto_padrao, validacao)
+            if not rel.nome:
+                rel.avisos.append("CNPJ não está na lista de fundos (nome em branco)")
+            if "pdf" in formatos:
+                salvar_pdf(rel, caminho_gravavel(saida / f"{rel.nome_arquivo}.pdf"), args.com_lastro, modelo)
+            if "xlsx" in formatos:
+                salvar_xlsx(rel, saida / f"{rel.nome_arquivo}.xlsx", args.com_lastro, modelo)
+            print(f"[OK] {rel.nome_arquivo}" + (f"  ({len(rel.avisos)} aviso(s))" if rel.avisos else ""))
+            resumo.append({"fundo": rel.nome, "cnpj": rel.cnpj, "pl": rel.celulas["C20"],
+                           "arquivo": rel.nome_arquivo, "avisos": " | ".join(rel.avisos)})
+        except Exception as e:  # um fundo com problema não interrompe o lote
+            erros += 1
+            nome = rel.nome_arquivo if rel else cnpj
+            print(f"[ERRO] {nome}: {type(e).__name__}: {e}")
+            resumo.append({"fundo": rel.nome if rel else "", "cnpj": cnpj, "pl": "",
+                           "arquivo": rel.nome_arquivo if rel else "",
+                           "avisos": f"ERRO ao gerar: {type(e).__name__}: {e}"})
 
-    with open(saida / "resumo_geracao.csv", "w", encoding="utf-8-sig", newline="") as f:
+    with open(caminho_gravavel(saida / "resumo_geracao.csv"), "w", encoding="utf-8-sig", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["fundo", "cnpj", "pl", "arquivo", "avisos"], delimiter=";")
         w.writeheader()
         w.writerows(resumo)
-    print(f"\nExportação em lote concluída: {len(resumo)} fundo(s) em {saida}")
+    print(f"\nExportação em lote concluída: {len(resumo) - erros} fundo(s) em {saida} "
+          f"({time.perf_counter() - inicio:.1f}s)")
     print(f"Resumo com avisos por fundo: {saida / 'resumo_geracao.csv'}")
+    if erros:
+        print(f"[ERRO] {erros} fundo(s) não foram gerados; veja o resumo.")
+        sys.exit(1)
 
 
 def _post_graphql(url: str, token: str, query: str) -> dict:
@@ -724,14 +1429,27 @@ def cmd_migrar(args, cfg):
 
     data_base = serial_para_data(setup.get(5, {}).get(2))
     if isinstance(data_base, dt.date):
-        caminho = cfg["_dir"] / "config.json" if not args.config else Path(args.config)
-        texto = Path(caminho).read_text(encoding="utf-8")
+        caminho = Path(args.config)
+        texto = caminho.read_text(encoding="utf-8")
         texto = re.sub(r'("data_base"\s*:\s*")[^"]*(")', rf"\g<1>{data_base.isoformat()}\g<2>", texto, count=1)
-        Path(caminho).write_text(texto, encoding="utf-8")
+        caminho.write_text(texto, encoding="utf-8")
         print(f"  data_base do config.json atualizada para {data_base.isoformat()}")
 
 
+def _saida_utf8():
+    """Evita UnicodeEncodeError ao gravar a saída num arquivo/pipe com a codificação do Windows."""
+    for fluxo in (sys.stdout, sys.stderr):
+        try:
+            if fluxo.isatty():
+                fluxo.reconfigure(errors="replace")
+            else:
+                fluxo.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv=None):
+    _saida_utf8()
     ap = argparse.ArgumentParser(description="Geradora do Demonstrativo Trimestral CVM - Limine")
     ap.add_argument("--config", default=str(BASE_DIR / "config.json"), help="arquivo de configuração")
     sub = ap.add_subparsers(dest="comando", required=True)
