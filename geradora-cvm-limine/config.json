@@ -4,7 +4,13 @@
   "pastas": {
       "entrada": "entrada",
       "saida": "G:\\Drives compartilhados\\Auditoria de Lastro – 2º Semestre – 2026\\3T2026\\LIMINE\\_DRAFT",
-      "validados": "G:\\Drives compartilhados\\Auditoria de Lastro – 2º Semestre – 2026\\3T2026\\LIMINE\\_Validados"
+      "validados": "G:\\Drives compartilhados\\Auditoria de Lastro – 2º Semestre – 2026\\3T2026\\LIMINE\\_Validados",
+      "revisao": "G:\\Drives compartilhados\\Auditoria de Lastro – 2º Semestre – 2026\\3T2026\\LIMINE\\_REVISAO_HUMANA"
+  },
+
+  "cvm": {
+      "url": "https://dados.cvm.gov.br/dados/FIDC/DOC/INF_MENSAL/DADOS/inf_mensal_fidc_{aaaamm}.zip",
+      "tolerancia": 1.0
   },
 
   "arquivos": {
@@ -30,7 +36,7 @@
     ["fif", "Outros Ativos"],
     ["valores a pagar", "Contas a Pagar"],
     ["outros ativos", "Outros Ativos"],
-    ["derivativos", "Patrimônio Líquido"],
+    ["derivativos", "(fora do relatório)"],
     ["swap", "Outros Ativos"],
     ["fidc", "Outros Ativos"],
     ["federais", "Títulos Públicos Federais"],

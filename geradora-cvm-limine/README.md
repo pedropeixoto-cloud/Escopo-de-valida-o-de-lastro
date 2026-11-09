@@ -34,6 +34,33 @@ pip install -r requirements.txt
    junto com um `resumo_geracao.csv` que traz o PL e os avisos de cada fundo. Se algum fundo
    falhar, os demais são gerados, o erro vai para o resumo e o comando termina com código 1.
 
+### Conferência automática com a CVM
+
+Antes de gravar, o `gerar` baixa o Informe Mensal FIDC do mês da data base nos dados abertos da CVM
+(`cvm.url` no `config.json`; cópia em `entrada/cvm/`, usada se a CVM estiver fora do ar). Em seguida,
+compara cada linha do quadro I com o informe do fundo:
+
+| Relatório | Informe Mensal FIDC (CVM) |
+|---|---|
+| Disponibilidades | `TAB_I1_VL_DISP` |
+| Títulos Públicos Federais | `TAB_I2D_VL_TITPUB_FED` |
+| Operações de Crédito | `TAB_I2A` + `TAB_I2B` + PDD (valor bruto) |
+| Provisão para Perdas (PDD) | −(`TAB_I2A11` + `TAB_I2B11`) |
+| Outros Ativos | ativo total − as linhas acima − compromissadas (`I2F`) − derivativos (`I3`) |
+| Contas a Pagar | −`TAB_III_A_VL_PAGAR` |
+| Patrimônio Líquido | `TAB_IV_A_VL_PL` |
+
+| Resultado | O que acontece | Pasta |
+|---|---|---|
+| Todas as linhas batem (diferença ≤ `cvm.tolerancia`, R$ 1) | nada | `pastas.saida` (_DRAFT) |
+| Diverge e o informe fecha (ativo − passivo = PL) | o relatório é **corrigido com o valor da CVM** e os % são recalculados | `pastas.revisao` (_REVISAO_HUMANA) |
+| Diverge e o informe não fecha ou está zerado | mantém a carteira | `pastas.revisao` |
+| Fundo sem informe na CVM no mês | mantém a carteira | `pastas.revisao` |
+
+O `revisao_cvm.csv` da pasta de revisão lista, por fundo, a linha, o valor da carteira, o valor da CVM
+e o que foi feito. O `resumo_geracao.csv` ganhou as colunas `conferencia_cvm` e `pasta`. Se um fundo muda
+de pasta entre uma geração e outra, a cópia antiga é apagada. Para gerar sem conferir, use `--sem-cvm`.
+
 **Passo 0 (opcional):** para aproveitar uma Geradora que já tem as bases coladas, rode:
 ```bash
 python geradora_cvm.py migrar --geradora "caminho\Geradora Limine - EMISSÃO EM LOTE.xlsb"
@@ -50,6 +77,8 @@ atualiza a `data_base`.
 | `--saida <pasta>` | grava em outra pasta |
 | `--data-base 2026-12-31` | troca a data base sem mexer no config |
 | `--com-lastro` | exibe as seções II e III, que ficam ocultas na planilha |
+| `--sem-cvm` | não confere com o Informe Mensal da CVM (tudo vai para `pastas.saida`) |
+| `--revisao <pasta>` | grava os fundos para revisão em outra pasta |
 | `--validados <pasta>` | preenche as linhas "analisados" (32 a 34) com o `.xlsx` cujo nome contém o CNPJ |
 
 Outro comando: `python geradora_cvm.py listar-validados` (antigo **Listar Verificação de Lastro**).
@@ -138,11 +167,15 @@ revogue o antigo.**
 - **Sem "-0,00%".** Percentuais muito pequenos e negativos saem como "0,00%", como no Excel.
 - **O XLSX não tem vínculo externo** com a planilha "Gerador Informe Mensal Sinqia" (o Excel
   não pede mais para atualizar vínculos ao abrir) nem a aba vazia "Planilha1".
+- **Derivativo passivo não entra mais no PL.** Na planilha, "Posicao em Derivativos - Passivo" (chave
+  `derivativos`) caía em Patrimônio Líquido e inflava o PL pelo valor do swap (no 3T2026: ENDURANCE, J17 FGTS,
+  BLIPS e PICPAY, conferidos contra o Informe Mensal da CVM). Agora a chave aponta para `(fora do relatório)`:
+  o PL passa a ser só a soma das subclasses, igual ao da CVM. A carteira não traz o lado ativo do swap, então
+  a soma das linhas não fecha com o PL nesses fundos e o `resumo_geracao.csv` avisa.
 - `popularGeradora` não foi portado. Ele salvava uma cópia `.xlsb` inteira por fundo, mas no layout atual
   do Setup lia o nome do fundo como se fosse o CNPJ e buscava carteiras no caminho do 2T2025. Os `.xlsb`
   que estão em `_CVM` saíram desse macro e têm todos os valores zerados.
 - Mantidos de propósito, por fidelidade (vale revisar):
   - `F33` divide por `D27`, quando o esperado seria `D28`.
-  - "Posicao em Derivativos - Passivo" cai em Patrimônio Líquido (chave `derivativos`).
   - "Operações Compromissadas" é mapeada, mas não tem linha no quadro e fica de fora (o script avisa).
   - "Valores a Receber" não tem chave de mapeamento, então sai sempre zerado.

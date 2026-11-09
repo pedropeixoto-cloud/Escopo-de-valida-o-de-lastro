@@ -32,6 +32,28 @@ def _xlsx(caminho: Path, linhas: list[list]):
     wb.save(caminho)
 
 
+# Informe Mensal FIDC fictício que bate com a carteira de ALFA e BETA
+INFORME_OK = {
+    ALFA: {"TAB_I_VL_ATIVO": 10500, "TAB_I1_VL_DISP": 1000, "TAB_I2A_VL_DIRCRED_RISCO": 8000,
+           "TAB_I2A11_VL_REDUCAO_RECUP": 500, "TAB_I2D_VL_TITPUB_FED": 1500,
+           "TAB_III_VL_PASSIVO": 500, "TAB_III_A_VL_PAGAR": 500, "TAB_IV_A_VL_PL": 10000},
+    BETA: {"TAB_I_VL_ATIVO": 100, "TAB_I1_VL_DISP": 100, "TAB_IV_A_VL_PL": 100},
+}
+
+
+def montar_informe_cvm(destino: Path, fundos: dict):
+    """Zip no formato dos dados abertos da CVM (tabelas I, III e IV, latin-1, separador ;)."""
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(destino, "w") as z:
+        for tab in g.TABELAS_CVM:
+            campos = sorted({k for v in fundos.values() for k in v if re.match(rf"TAB_{tab}(_|\d)", k)})
+            linhas = ["TP_FUNDO_CLASSE;CNPJ_FUNDO_CLASSE;DENOM_SOCIAL;DT_COMPTC;" + ";".join(campos)]
+            for cnpj, v in fundos.items():
+                linhas.append(f"Classe;{cnpj};FUNDO FICTÍCIO;2026-09-30;"
+                              + ";".join(f"{v.get(c, 0):.2f}" for c in campos))
+            z.writestr(f"inf_mensal_fidc_tab_{tab}_202609.csv", "\n".join(linhas).encode("latin-1"))
+
+
 def montar_entrada(pasta: Path) -> Path:
     """Bases fictícias: ALFA completo, BETA sem Pipefy, GAMA sem carteira."""
     entrada = pasta / "entrada"
@@ -68,9 +90,12 @@ def montar_entrada(pasta: Path) -> Path:
     _xlsx(entrada / "pipefy.xlsx", [campos,
                                      ["ALFA CARD", ALFA] + [resposta[c] for c in campos[2:]],
                                      ["ALFA CARD ANTIGO", ALFA] + ["ignorado"] * 12])
+    publicado = pasta / "cvm_publicado"
+    montar_informe_cvm(publicado / "inf_mensal_fidc_202609.zip", INFORME_OK)
     cfg = json.loads((Path(g.BASE_DIR) / "config.json").read_text(encoding="utf-8"))
     cfg["data_base"] = DATA_BASE.isoformat()
     cfg["pastas"] = {"entrada": str(entrada), "saida": str(pasta / "saida"), "validados": str(pasta / "validados")}
+    cfg["cvm"] = {"url": publicado.as_uri() + "/inf_mensal_fidc_{aaaamm}.zip", "tolerancia": 1.0}
     (pasta / "config.json").write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
     return pasta / "config.json"
 
@@ -99,7 +124,7 @@ class TestRegras(Base):
         self.assertEqual(g.mapear_descricao("Direitos Creditorios COM a Vencer", m), "Operações de Crédito")
         self.assertEqual(g.mapear_descricao("Provisao - PDD", m), "Provisão para Perdas (PDD)")
         self.assertEqual(g.mapear_descricao("Titulos Publicos Federais", m), "Títulos Públicos Federais")
-        self.assertEqual(g.mapear_descricao("Posicao em Derivativos - Passivo", m), "Patrimônio Líquido")
+        self.assertEqual(g.mapear_descricao("Posicao em Derivativos - Passivo", m), g.FORA_DO_RELATORIO)
         self.assertEqual(g.mapear_descricao("Algo desconhecido", m), "")
 
     def test_composicao_da_carteira(self):
@@ -272,7 +297,7 @@ class TestComandoGerar(Base):
         self.assertIn("concluída: 2 fundo(s)", log)
         self.assertFalse([p for p in (pasta / "saida").iterdir() if "44444444000144" in p.name])
         resumo = (pasta / "saida" / "resumo_geracao.csv").read_text(encoding="utf-8-sig")
-        self.assertIn(f"DELTA CARD;{delta};;;NÃO GERADO", resumo)
+        self.assertIn(f"DELTA CARD;{delta};;;;;NÃO GERADO", resumo)  # pl, arquivo, conferencia_cvm e pasta vazios
 
         # gerando só CNPJs escolhidos, não avisa
         saida = io.StringIO()
@@ -295,6 +320,101 @@ class TestComandoGerar(Base):
         rel = g.calcular(bases, ALFA, DATA_BASE, self.rotulos, TEXTO_PADRAO)
         self.assertEqual(rel.celulas["C20"], 10000.0)
         self.assertEqual(rel.celulas["C15"], 8500.0)
+
+
+class TestConferenciaCVM(Base):
+    def informe(self, **mudancas):
+        reg = {k: str(v) for k, v in INFORME_OK[ALFA].items()}
+        reg.update({k: str(v) for k, v in mudancas.items()})
+        return {g.digitos(ALFA): reg}
+
+    def test_bate_com_a_cvm(self):
+        rel = self.calcular(ALFA)
+        conf = g.conferir_cvm(rel, self.informe())
+        self.assertEqual(conf.status, g.STATUS_OK)
+        self.assertFalse(conf.revisar)
+
+    def test_corrige_com_a_cvm_quando_o_informe_fecha(self):
+        rel = self.calcular(ALFA)
+        # CVM: PL 9.800 e contas a pagar 700 (ativo 10.500 - passivo 700 = 9.800)
+        conf = g.conferir_cvm(rel, self.informe(TAB_III_VL_PASSIVO=700, TAB_III_A_VL_PAGAR=700,
+                                                TAB_IV_A_VL_PL=9800))
+        self.assertEqual(conf.status, g.STATUS_CORRIGIDO)
+        self.assertEqual({d[0] for d in conf.divergencias}, {19, 20})
+        self.assertEqual(rel.celulas["C20"], 9800)
+        self.assertEqual(rel.celulas["C19"], -700)
+        self.assertAlmostEqual(rel.celulas["D13"], 1000 / 9800)
+        self.assertAlmostEqual(rel.celulas["D20"], 1.0)
+        self.assertTrue(any("corrigido com o informe da CVM" in a for a in rel.avisos))
+
+    def test_nao_corrige_quando_o_informe_nao_fecha(self):
+        rel = self.calcular(ALFA)
+        conf = g.conferir_cvm(rel, self.informe(TAB_IV_A_VL_PL=0))
+        self.assertEqual(conf.status, g.STATUS_INCONSISTENTE)
+        self.assertEqual(rel.celulas["C20"], 10000.0)   # mantém a carteira
+
+    def test_nao_corrige_com_informe_zerado(self):
+        rel = self.calcular(ALFA)
+        zerado = {k: 0 for k in INFORME_OK[ALFA]}
+        conf = g.conferir_cvm(rel, self.informe(**zerado))
+        self.assertEqual(conf.status, g.STATUS_INCONSISTENTE)
+        self.assertEqual(rel.celulas["C20"], 10000.0)
+
+    def test_fundo_sem_informe(self):
+        rel = self.calcular(BETA)
+        conf = g.conferir_cvm(rel, self.informe())
+        self.assertEqual(conf.status, g.STATUS_SEM_INFORME)
+        self.assertTrue(conf.revisar)
+
+    def test_outros_ativos_sem_derivativos_e_compromissadas(self):
+        v = g.valores_cvm({"TAB_I_VL_ATIVO": "1000", "TAB_I1_VL_DISP": "100", "TAB_I2F_VL_OPER_COMPROM": "50",
+                           "TAB_I3_VL_POSICAO_DERIV": "300", "TAB_I2C5_VL_COTA_FIF": "550"})
+        self.assertEqual(v[17], 550)
+
+    def test_gerar_separa_os_fundos_para_revisao(self):
+        pasta = self.tmp / "revisao"
+        publicado = pasta / "publicado"
+        divergente = dict(INFORME_OK, **{BETA: {"TAB_I_VL_ATIVO": 100, "TAB_I1_VL_DISP": 100,
+                                                "TAB_IV_A_VL_PL": 90, "TAB_III_VL_PASSIVO": 10,
+                                                "TAB_III_A_VL_PAGAR": 10}})
+        montar_informe_cvm(publicado / "inf_mensal_fidc_202609.zip", divergente)
+        cfg = json.loads(self.config.read_text(encoding="utf-8"))
+        cfg["pastas"] = dict(cfg["pastas"], saida=str(pasta / "saida"), revisao=str(pasta / "rev"))
+        cfg["cvm"]["url"] = publicado.as_uri() + "/inf_mensal_fidc_{aaaamm}.zip"
+        config = pasta / "config.json"
+        config.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+        # um BETA antigo no _DRAFT deve sair de lá
+        (pasta / "saida").mkdir(parents=True)
+        (pasta / "saida" / "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.pdf").write_bytes(b"antigo")
+        log = io.StringIO()
+        with redirect_stdout(log):
+            g.main(["--config", str(config), "gerar"])
+        saida = sorted(p.name for p in (pasta / "saida").iterdir())
+        rev = sorted(p.name for p in (pasta / "rev").iterdir())
+        self.assertIn("FUNDO ALFA FIDC_11111111000111_TRIMESTRAL_CVM.pdf", saida)
+        self.assertFalse([a for a in saida if "BETA" in a])
+        self.assertIn("FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.pdf", rev)
+        self.assertIn("FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.xlsx", rev)
+        self.assertIn("[REVISAR] FUNDO BETA", log.getvalue())
+        csv_rev = (pasta / "rev" / "revisao_cvm.csv").read_text(encoding="utf-8-sig")
+        self.assertIn(g.STATUS_CORRIGIDO, csv_rev)
+        self.assertIn("Patrimônio Líquido", csv_rev)
+        ws = openpyxl.load_workbook(pasta / "rev" / "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.xlsx").active
+        self.assertEqual(ws["C20"].value, 90)
+        self.assertEqual(ws["C19"].value, -10)
+
+    def test_sem_cvm(self):
+        pasta = self.tmp / "sem_cvm"
+        cfg = json.loads(self.config.read_text(encoding="utf-8"))
+        cfg["pastas"] = dict(cfg["pastas"], saida=str(pasta / "saida"), revisao=str(pasta / "rev"))
+        cfg["cvm"]["url"] = (pasta / "nao_existe").as_uri() + "/{aaaamm}.zip"
+        pasta.mkdir()
+        config = pasta / "config.json"
+        config.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+        with redirect_stdout(io.StringIO()):
+            g.main(["--config", str(config), "gerar", "--sem-cvm"])
+        self.assertTrue((pasta / "saida" / "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.pdf").exists())
+        self.assertFalse((pasta / "rev").exists())
 
 
 if __name__ == "__main__":

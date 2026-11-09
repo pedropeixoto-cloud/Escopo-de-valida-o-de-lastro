@@ -261,6 +261,10 @@ class Bases:
             self.nome_por_cnpj.setdefault(digitos(f["cnpj"]), f["nome"])
 
 
+# Destino de mapeamento para linhas que a carteira traz, mas que não entram no quadro.
+FORA_DO_RELATORIO = "(fora do relatório)"
+
+
 def mapear_descricao(descricao, mapeamento) -> str:
     """CarteiraInforme!G: primeira chave (na ordem da tabela I:J) contida em LOWER(Descricao).
 
@@ -398,6 +402,21 @@ def nome_do_fundo(bases: Bases, cnpj: str) -> str:
     return bases.nome_por_cnpj.get(digitos(cnpj), "")
 
 
+AVISO_SOMA = "Soma das linhas da composição difere do Patrimônio Líquido"
+
+
+def percentuais_composicao(c: dict) -> str:
+    """D13:D20 a partir de C13:C20. Devolve o aviso quando as linhas não somam o PL."""
+    pl = c["C20"]
+    for linha in range(13, 20):
+        c[f"D{linha}"] = div(c[f"C{linha}"], pl)                       # =IFERROR(C13/$C$20,0%)
+    c["D20"] = sum(c[f"D{l}"] for l in range(13, 20))                  # =SUM(D13:D19)
+    soma_linhas = sum(c[f"C{l}"] for l in range(13, 20))
+    if pl and abs(soma_linhas - pl) > 0.01:
+        return f"{AVISO_SOMA} (soma={soma_linhas:.2f}; PL={pl:.2f})"
+    return ""
+
+
 def calcular(bases: Bases, cnpj: str, data_base: dt.date, rotulos_composicao: dict,
              texto_padrao: str, validacao: list[dict] | None = None) -> Relatorio:
     cnpj = cnpj.strip()
@@ -425,15 +444,14 @@ def calcular(bases: Bases, cnpj: str, data_base: dt.date, rotulos_composicao: di
         soma_cat[norm(l["categoria"])] += l["valor"]
     for linha, rotulo in rotulos_composicao.items():
         c[f"C{linha}"] = soma_cat.get(norm(rotulo), 0)
-    pl = c["C20"]
-    for linha in range(13, 20):
-        c[f"D{linha}"] = div(c[f"C{linha}"], pl)                       # =IFERROR(C13/$C$20,0%)
-    c["D20"] = sum(c[f"D{l}"] for l in range(13, 20))                  # =SUM(D13:D19)
-    soma_linhas = sum(c[f"C{l}"] for l in range(13, 20))
-    if pl and abs(soma_linhas - pl) > 0.01:
-        avisos.append("Soma das linhas da composição difere do Patrimônio Líquido "
-                      f"(soma={soma_linhas:.2f}; PL={pl:.2f})")
-    no_quadro = {norm(r) for r in rotulos_composicao.values()}
+    aviso_soma = percentuais_composicao(c)
+    if aviso_soma:
+        avisos.append(aviso_soma)
+    fora = [l for l in linhas_fundo if norm(l["categoria"]) == norm(FORA_DO_RELATORIO)]
+    if fora:
+        avisos.append("Linhas fora do relatório: " + "; ".join(
+            f"{l['descricao']} = {l['valor']:.2f}" for l in fora))
+    no_quadro = {norm(r) for r in rotulos_composicao.values()} | {norm(FORA_DO_RELATORIO)}
     outras = sorted({l["categoria"] for l in linhas_fundo if l["categoria"] and norm(l["categoria"]) not in no_quadro})
     if outras:
         avisos.append("Categorias da carteira que não aparecem no quadro: " + ", ".join(outras))
@@ -1278,6 +1296,159 @@ def _desenhar_texto(cv, t: _Texto, x0, y0, x1, y1, alt_pag, k) -> None:
 # --------------------------------------------------------------------------
 # comandos
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# conferência com o Informe Mensal FIDC publicado pela CVM (dados abertos)
+# --------------------------------------------------------------------------
+URL_CVM_PADRAO = "https://dados.cvm.gov.br/dados/FIDC/DOC/INF_MENSAL/DADOS/inf_mensal_fidc_{aaaamm}.zip"
+TABELAS_CVM = ("I", "III", "IV")  # ativo, passivo e patrimônio líquido
+
+# Linhas do quadro I conferidas (a 18, Valores a Receber, não tem campo no informe)
+LINHAS_CONFERIDAS = {
+    13: "Disponibilidades",
+    14: "Títulos Públicos Federais",
+    15: "Operações de Crédito",
+    16: "Provisão para Perdas (PDD)",
+    17: "Outros Ativos",
+    19: "Contas a Pagar",
+    20: "Patrimônio Líquido",
+}
+
+STATUS_OK = "OK"
+STATUS_CORRIGIDO = "corrigido com a CVM"
+STATUS_INCONSISTENTE = "informe da CVM inconsistente"
+STATUS_SEM_INFORME = "sem informe na CVM"
+
+
+def _br(valor) -> str:
+    return "" if valor is None else f"{valor:.2f}".replace(".", ",")
+
+
+def _cfg_cvm(cfg: dict) -> dict:
+    return {"url": URL_CVM_PADRAO, "tolerancia": 1.0, **cfg.get("cvm", {})}
+
+
+def baixar_informe_cvm(cfg: dict, data_base: dt.date) -> Path:
+    """Baixa o zip do mês da data base para entrada/cvm. Sem rede, usa a cópia já baixada."""
+    aaaamm = data_base.strftime("%Y%m")
+    pasta = caminho_cfg(cfg, "entrada") / "cvm"
+    pasta.mkdir(parents=True, exist_ok=True)
+    destino = pasta / f"inf_mensal_fidc_{aaaamm}.zip"
+    url = _cfg_cvm(cfg)["url"].format(aaaamm=aaaamm)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "geradora-cvm-limine"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            conteudo = resp.read()
+        zipfile.ZipFile(io.BytesIO(conteudo)).testzip()
+        temporario = destino.with_suffix(".tmp")
+        temporario.write_bytes(conteudo)
+        os.replace(temporario, destino)
+        print(f"[INFO] Informe Mensal FIDC {aaaamm} baixado da CVM: {url}")
+    except Exception as e:
+        if not destino.exists():
+            raise SystemExit(f"[ERRO] Não foi possível baixar o Informe Mensal FIDC da CVM ({url}): {e}\n"
+                             f"Baixe o arquivo para {destino} ou rode com --sem-cvm.") from e
+        print(f"[AVISO] Não foi possível baixar o informe da CVM ({e}); usando a cópia local {destino}")
+    return destino
+
+
+def ler_informe_cvm(arquivo_zip: Path, data_base: dt.date) -> dict[str, dict]:
+    """CNPJ (só dígitos) -> campos das tabelas I, III e IV do informe do mês."""
+    aaaamm = data_base.strftime("%Y%m")
+    informe: dict[str, dict] = {}
+    with zipfile.ZipFile(arquivo_zip) as z:
+        nomes = {n.lower(): n for n in z.namelist()}
+        for tab in TABELAS_CVM:
+            nome = nomes.get(f"inf_mensal_fidc_tab_{tab}_{aaaamm}.csv".lower())
+            if not nome:
+                raise SystemExit(f"[ERRO] {arquivo_zip} não tem a tabela {tab} de {aaaamm}")
+            texto = z.read(nome).decode("latin-1")
+            vistos = set()
+            for linha in csv.DictReader(io.StringIO(texto), delimiter=";"):
+                cnpj = digitos(linha.get("CNPJ_FUNDO_CLASSE"))
+                if not cnpj or cnpj in vistos:   # 1ª linha de cada CNPJ em cada tabela
+                    continue
+                vistos.add(cnpj)
+                informe.setdefault(cnpj, {}).update(linha)
+    return informe
+
+
+def valores_cvm(reg: dict) -> dict:
+    """Linhas do quadro I segundo o informe da CVM, com a mesma classificação da carteira.
+
+    Operações de Crédito vêm brutas (com e sem aquisição substancial de riscos) e a PDD sai à parte.
+    Outros Ativos é o restante do ativo, sem compromissadas e derivativos, que o quadro não mostra.
+    """
+    def v(campo):  # os CSVs da CVM usam ponto decimal
+        try:
+            return float(reg.get(campo) or 0)
+        except ValueError:
+            return 0.0
+    pdd = v("TAB_I2A11_VL_REDUCAO_RECUP") + v("TAB_I2B11_VL_REDUCAO_RECUP")
+    credito = v("TAB_I2A_VL_DIRCRED_RISCO") + v("TAB_I2B_VL_DIRCRED_SEM_RISCO")
+    disp, tpf, ativo = v("TAB_I1_VL_DISP"), v("TAB_I2D_VL_TITPUB_FED"), v("TAB_I_VL_ATIVO")
+    return {
+        13: disp,
+        14: tpf,
+        15: credito + pdd,
+        16: -pdd,
+        17: ativo - disp - tpf - credito - v("TAB_I2F_VL_OPER_COMPROM") - v("TAB_I3_VL_POSICAO_DERIV"),
+        19: -v("TAB_III_A_VL_PAGAR"),
+        20: v("TAB_IV_A_VL_PL"),
+        "ativo": ativo,
+        "passivo": v("TAB_III_VL_PASSIVO"),
+    }
+
+
+@dataclass
+class ConferenciaCVM:
+    status: str
+    divergencias: list = field(default_factory=list)  # (linha, descrição, valor da carteira, valor da CVM)
+    acao: str = ""
+
+    @property
+    def revisar(self) -> bool:
+        return self.status != STATUS_OK
+
+
+def conferir_cvm(rel: Relatorio, informe: dict[str, dict], tolerancia: float = 1.0) -> ConferenciaCVM:
+    """Compara o quadro I com o informe da CVM e corrige o relatório quando o informe é confiável.
+
+    - todas as linhas batem (diferença <= tolerância): OK
+    - o informe não fecha (ativo - passivo != PL): mantém a carteira e manda para revisão
+    - senão: troca os valores divergentes pelos da CVM, recalcula os % e manda para revisão
+    """
+    reg = informe.get(digitos(rel.cnpj))
+    if reg is None:
+        rel.avisos.append("Conferência CVM: fundo sem Informe Mensal na CVM para o mês da data base")
+        return ConferenciaCVM(STATUS_SEM_INFORME, acao="conferir manualmente")
+    cvm = valores_cvm(reg)
+    c = rel.celulas
+    divergencias = [(linha, desc, c.get(f"C{linha}", 0), cvm[linha])
+                    for linha, desc in LINHAS_CONFERIDAS.items()
+                    if abs(c.get(f"C{linha}", 0) - cvm[linha]) > tolerancia]
+    if not divergencias:
+        return ConferenciaCVM(STATUS_OK)
+    texto = "; ".join(f"{d}: carteira {a:.2f}, CVM {b:.2f}" for _, d, a, b in divergencias)
+    fechamento = cvm["ativo"] - cvm["passivo"] - cvm[20]
+    if abs(cvm["ativo"]) <= tolerancia and abs(cvm[20]) <= tolerancia:
+        acao = "mantidos os valores da carteira: o informe da CVM está zerado (ativo e PL = 0)"
+        rel.avisos.append(f"Conferência CVM: {texto}; {acao}")
+        return ConferenciaCVM(STATUS_INCONSISTENTE, divergencias, acao)
+    if abs(fechamento) > tolerancia:
+        acao = (f"mantidos os valores da carteira: o informe da CVM não fecha (ativo {cvm['ativo']:.2f} "
+                f"- passivo {cvm['passivo']:.2f} - PL {cvm[20]:.2f} = {fechamento:.2f})")
+        rel.avisos.append(f"Conferência CVM: {texto}; {acao}")
+        return ConferenciaCVM(STATUS_INCONSISTENTE, divergencias, acao)
+    for linha, _, _, valor in divergencias:
+        c[f"C{linha}"] = valor
+    rel.avisos[:] = [a for a in rel.avisos if not a.startswith(AVISO_SOMA)]
+    aviso_soma = percentuais_composicao(c)
+    if aviso_soma:
+        rel.avisos.append(aviso_soma)
+    rel.avisos.append(f"Conferência CVM: corrigido com o informe da CVM ({texto})")
+    return ConferenciaCVM(STATUS_CORRIGIDO, divergencias, "relatório corrigido com o valor da CVM")
+
+
 def cmd_gerar(args, cfg):
     bases = carregar_bases(cfg)
     for a in bases.avisos_gerais:
@@ -1285,6 +1456,17 @@ def cmd_gerar(args, cfg):
     data_base = para_data(args.data_base or cfg["data_base"])
     saida = Path(args.saida) if args.saida else caminho_cfg(cfg, "saida")
     caminho_gravavel(saida).mkdir(parents=True, exist_ok=True)
+    informe, revisao = None, None
+    tolerancia = float(_cfg_cvm(cfg)["tolerancia"])
+    if not args.sem_cvm:
+        informe = ler_informe_cvm(baixar_informe_cvm(cfg, data_base), data_base)
+        if args.revisao:
+            revisao = Path(args.revisao)
+        elif "revisao" in cfg["pastas"]:
+            revisao = caminho_cfg(cfg, "revisao")
+        else:
+            revisao = saida.parent / "_REVISAO_HUMANA"
+        caminho_gravavel(revisao).mkdir(parents=True, exist_ok=True)
     modelo = carregar_modelo()
     rotulos = rotulos_composicao(modelo.ws)
     texto_padrao = cfg["texto_gestor_sem_resposta"]
@@ -1320,6 +1502,7 @@ def cmd_gerar(args, cfg):
     pasta_validados = Path(args.validados) if args.validados else None
     validados = list(pasta_validados.glob("*.xlsx")) if pasta_validados else []
     nao_listados = len(resumo)
+    revisoes = []
     inicio = time.perf_counter()
     for cnpj in alvo:
         rel = None
@@ -1331,31 +1514,60 @@ def cmd_gerar(args, cfg):
             rel = calcular(bases, cnpj, data_base, rotulos, texto_padrao, validacao)
             if not rel.nome:
                 rel.avisos.append("CNPJ não está na lista de fundos (nome em branco)")
-            if "pdf" in formatos:
-                salvar_pdf(rel, caminho_gravavel(saida / f"{rel.nome_arquivo}.pdf"), args.com_lastro, modelo)
-            if "xlsx" in formatos:
-                salvar_xlsx(rel, saida / f"{rel.nome_arquivo}.xlsx", args.com_lastro, modelo)
-            print(f"[OK] {rel.nome_arquivo}" + (f"  ({len(rel.avisos)} aviso(s))" if rel.avisos else ""))
+            conf = conferir_cvm(rel, informe, tolerancia) if informe is not None else None
+            revisar = bool(conf and conf.revisar)
+            destino, outra = (revisao, saida) if revisar else (saida, revisao)
+            for ext in sorted(formatos):
+                if outra is not None:  # se o fundo trocou de pasta desde a última geração, tira a cópia antiga
+                    antigo = outra / f"{rel.nome_arquivo}.{ext}"
+                    if antigo.is_file():
+                        antigo.unlink()
+                arquivo = destino / f"{rel.nome_arquivo}.{ext}"
+                if ext == "pdf":
+                    salvar_pdf(rel, caminho_gravavel(arquivo), args.com_lastro, modelo)
+                else:
+                    salvar_xlsx(rel, arquivo, args.com_lastro, modelo)
+            print(("[REVISAR] " if revisar else "[OK] ") + rel.nome_arquivo
+                  + (f"  ({conf.status})" if revisar else "")
+                  + (f"  ({len(rel.avisos)} aviso(s))" if rel.avisos else ""))
             resumo.append({"fundo": rel.nome, "cnpj": rel.cnpj, "pl": rel.celulas["C20"],
-                           "arquivo": rel.nome_arquivo, "avisos": " | ".join(rel.avisos)})
+                           "arquivo": rel.nome_arquivo,
+                           "conferencia_cvm": conf.status if conf else "não conferido",
+                           "pasta": str(destino), "avisos": " | ".join(rel.avisos)})
+            if revisar:
+                base_rev = {"fundo": rel.nome, "cnpj": rel.cnpj, "status": conf.status, "acao": conf.acao}
+                for linha, desc, a, b in conf.divergencias or [("", "", None, None)]:
+                    revisoes.append({**base_rev, "linha": f"C{linha}" if linha else "", "descricao": desc,
+                                     "valor_carteira": _br(a), "valor_cvm": _br(b),
+                                     "diferenca": _br(a - b) if a is not None else ""})
         except Exception as e:  # um fundo com problema não interrompe o lote
             erros += 1
             nome = rel.nome_arquivo if rel else cnpj
             print(f"[ERRO] {nome}: {type(e).__name__}: {e}")
             resumo.append({"fundo": rel.nome if rel else "", "cnpj": cnpj, "pl": "",
-                           "arquivo": rel.nome_arquivo if rel else "",
+                           "arquivo": rel.nome_arquivo if rel else "", "conferencia_cvm": "", "pasta": "",
                            "avisos": f"ERRO ao gerar: {type(e).__name__}: {e}"})
 
     with open(caminho_gravavel(saida / "resumo_geracao.csv"), "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["fundo", "cnpj", "pl", "arquivo", "avisos"], delimiter=";")
+        w = csv.DictWriter(f, fieldnames=["fundo", "cnpj", "pl", "arquivo", "conferencia_cvm", "pasta", "avisos"],
+                           delimiter=";")
         w.writeheader()
         w.writerows(resumo)
+    if revisao is not None:
+        with open(caminho_gravavel(revisao / "revisao_cvm.csv"), "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["fundo", "cnpj", "status", "linha", "descricao", "valor_carteira",
+                                              "valor_cvm", "diferenca", "acao"], delimiter=";")
+            w.writeheader()
+            w.writerows(revisoes)
     print(f"\nExportação em lote concluída: {len(resumo) - erros - nao_listados} fundo(s) em {saida} "
           f"({time.perf_counter() - inicio:.1f}s)")
     if nao_listados:
         print(f"[AVISO] {nao_listados} fundo(s) da carteira ficaram de fora por não estarem na lista; "
               "veja o resumo.")
     print(f"Resumo com avisos por fundo: {saida / 'resumo_geracao.csv'}")
+    if revisao is not None:
+        n_rev = len({r["cnpj"] for r in revisoes})
+        print(f"Conferência com a CVM: {n_rev} fundo(s) para revisão humana em {revisao} (detalhes em revisao_cvm.csv)")
     if erros:
         print(f"[ERRO] {erros} fundo(s) não foram gerados; veja o resumo.")
         sys.exit(1)
@@ -1494,6 +1706,9 @@ def main(argv=None):
     g.add_argument("--com-lastro", action="store_true",
                    help="mostra as seções II e III (ocultas na planilha original)")
     g.add_argument("--validados", help="pasta com as validações por fundo (linhas 32-34; arquivo com o CNPJ no nome)")
+    g.add_argument("--sem-cvm", action="store_true",
+                   help="não confere com o Informe Mensal FIDC da CVM (tudo vai para a pasta de saída)")
+    g.add_argument("--revisao", help="pasta dos fundos que precisam de revisão humana (padrão: pastas.revisao)")
     g.set_defaults(func=cmd_gerar)
 
     p = sub.add_parser("pipefy", help="baixa o relatório do Pipefy para a pasta de entrada")
