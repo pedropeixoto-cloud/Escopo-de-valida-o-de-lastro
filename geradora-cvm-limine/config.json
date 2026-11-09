@@ -1,0 +1,45 @@
+{
+  "data_base": "2026-09-30",
+
+  "pastas": {
+      "entrada": "entrada",
+      "saida": "G:\\Drives compartilhados\\Auditoria de Lastro – 2º Semestre – 2026\\3T2026\\LIMINE\\_DRAFT",
+      "validados": "G:\\Drives compartilhados\\Auditoria de Lastro – 2º Semestre – 2026\\3T2026\\LIMINE\\_Validados"
+  },
+
+  "arquivos": {
+      "fundos": "fundos.xlsx",
+      "carteira_informe": "carteira_informe.xlsx",
+      "resumo_sinqia": "resumo_sinqia.xlsx",
+      "pipefy": "pipefy.xlsx"
+  },
+
+  "pipefy": {
+      "url": "https://api.pipefy.com/graphql",
+      "pipe_id": 305680354,
+      "pipe_report_id": 300828694,
+      "variavel_token": "PIPEFY_TOKEN"
+  },
+
+  "mapeamento_carteira": [
+    ["disponibilidades", "Disponibilidades"],
+    ["pdd", "Provisão para Perdas (PDD)"],
+    ["vencer", "Operações de Crédito"],
+    ["vencidos", "Operações de Crédito"],
+    ["compromissadas", "Operações Compromissadas"],
+    ["fif", "Outros Ativos"],
+    ["valores a pagar", "Contas a Pagar"],
+    ["outros ativos", "Outros Ativos"],
+    ["derivativos", "Patrimônio Líquido"],
+    ["swap", "Outros Ativos"],
+    ["fidc", "Outros Ativos"],
+    ["federais", "Títulos Públicos Federais"],
+    ["cdb", "Outros Ativos"],
+    ["cri", "Outros Ativos"],
+    ["nota", "Outros Ativos"],
+    ["valores mobiliarios", "Outros Ativos"],
+    ["subclasse", "Patrimônio Líquido"]
+  ],
+
+  "texto_gestor_sem_resposta": "O Gestor do referido Fundo não se manifestou dentro do período objeto deste relatório trimestral, em resposta aos questionamentos de sua responsabilidade, conforme previsto no Art. 27 parágrafo 3 da RCVM 175/22"
+}

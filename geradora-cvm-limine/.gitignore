@@ -1,0 +1,4 @@
+# bases dos fundos (dados confidenciais) e caches
+entrada/*
+!entrada/.gitkeep
+__pycache__/
