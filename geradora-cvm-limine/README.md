@@ -53,7 +53,8 @@ Pipefy como `entrada/pipefy_atualizacoes.xlsx`. Ela precisa ter `CNPJ do Fundo` 
   (por exemplo o item 9, de processos judiciais).
 - Dois cards com o mesmo CNPJ: vale o que tem o nome do fundo da lista. O outro é aplicado ao fundo de
   mesmo nome, se houver, ou ignorado. Nos dois casos sai um aviso.
-- O `resumo_geracao.csv` marca os fundos que usaram a extração.
+- O `resumo_geracao.csv` marca os fundos que usaram a extração, e o PDF deles (quando bate com a CVM)
+  fica separado em `REVISADOS\ALTERADOS PELA PLANILHA`.
 
 Ordem de prioridade dos textos: `respostas_gestor.xlsx` → `pipefy_atualizacoes.xlsx` → `pipefy.xlsx` →
 texto padrão.

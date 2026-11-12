@@ -370,6 +370,23 @@ class TestAtualizacoesPipefy(Base):
         beta = g.calcular(bases, BETA, DATA_BASE, self.rotulos, TEXTO_PADRAO)
         self.assertEqual(beta.celulas, self.calcular(BETA).celulas)       # fundo fora da extração não muda
 
+    def test_gerar_separa_os_pdfs_alterados_pela_planilha(self):
+        pasta = self.tmp / "alterados"
+        shutil.copytree(self.tmp / "entrada", pasta / "entrada")
+        _xlsx(pasta / "entrada" / "pipefy_atualizacoes.xlsx",
+              [["Título", "CNPJ do Fundo", "Descrição item 1"], ["ALFA", ALFA, "Política nova"]])
+        cfg = json.loads(self.config.read_text(encoding="utf-8"))
+        cfg["pastas"] = dict(cfg["pastas"], entrada=str(pasta / "entrada"), saida=str(pasta / "saida"))
+        config = pasta / "config.json"
+        config.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+        with redirect_stdout(io.StringIO()):
+            g.main(["--config", str(config), "gerar"])
+        ok = pasta / "saida" / OK_DIR
+        alterados = ok / g.SUBPASTAS_PADRAO["revisados_atualizados"]
+        self.assertEqual([p.name for p in alterados.iterdir()], ["FUNDO ALFA FIDC_11111111000111_TRIMESTRAL_CVM.pdf"])
+        self.assertTrue((ok / "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.pdf").exists())
+        self.assertFalse((ok / "FUNDO ALFA FIDC_11111111000111_TRIMESTRAL_CVM.pdf").exists())
+
     def test_fundo_sem_card_na_base_ganha_os_textos(self):
         bases = self.bases_com([["BETA", "Jurídico", "FUNDO BETA FIDC", BETA, "Política do BETA", "Sem garantias"]])
         beta = g.calcular(bases, BETA, DATA_BASE, self.rotulos, TEXTO_PADRAO)

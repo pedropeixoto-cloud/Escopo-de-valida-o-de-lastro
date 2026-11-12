@@ -465,6 +465,7 @@ class Relatorio:
     data_base: dt.date
     celulas: dict  # "B3" -> valor (apenas as células calculadas)
     avisos: list[str]
+    atualizado_pipefy: bool = False  # textos do gestor vieram de pipefy_atualizacoes.xlsx
 
     @property
     def nome_arquivo(self) -> str:
@@ -621,7 +622,8 @@ def calcular(bases: Bases, cnpj: str, data_base: dt.date, rotulos_composicao: di
                 avisos[:] = [a for a in avisos if not a.startswith("Sem resposta do gestor no Pipefy")]
             avisos.append("Textos do gestor de respostas_gestor.xlsx (substituem o Pipefy): " + ", ".join(usadas))
 
-    return Relatorio(nome, cnpj, data_base, c, avisos)
+    return Relatorio(nome, cnpj, data_base, c, avisos,
+                     atualizado_pipefy=bool(resposta and resposta.get(MARCA_ATUALIZADO)))
 
 
 # --------------------------------------------------------------------------
@@ -1435,7 +1437,9 @@ LINHAS_CONFERIDAS = {
 }
 
 # Subpastas da pasta de saída (config.json -> "subpastas")
-SUBPASTAS_PADRAO = {"revisados": "REVISADOS", "revisao_humana": "SEM INFORME", "insumos": "DRAFT EXCEL"}
+SUBPASTAS_PADRAO = {"revisados": "REVISADOS", "revisao_humana": "SEM INFORME", "insumos": "DRAFT EXCEL",
+                    # dentro de "revisados": fundos com textos trocados por pipefy_atualizacoes.xlsx
+                    "revisados_atualizados": "ALTERADOS PELA PLANILHA"}
 
 STATUS_OK = "OK"
 STATUS_CORRIGIDO = "corrigido com a CVM"
@@ -1584,17 +1588,18 @@ def cmd_gerar(args, cfg):
     #   PDF que bate com o informe -> "revisados" (pronto para emitir)
     #   PDF que não bate           -> "revisao_humana" (com o revisao_cvm.csv)
     #   XLSX (draft) de todos      -> "insumos"
-    informe, revisados, insumos, revisao = None, saida, saida, None
+    informe, revisados, revisados_alt, insumos, revisao = None, saida, saida, saida, None
     tolerancia = float(_cfg_cvm(cfg)["tolerancia"])
     if not args.sem_cvm:
         informe = ler_informe_cvm(baixar_informe_cvm(cfg, data_base), data_base)
         subpastas = {**SUBPASTAS_PADRAO, **cfg.get("subpastas", {})}
         revisados = saida / subpastas["revisados"]
+        revisados_alt = revisados / subpastas["revisados_atualizados"]
         insumos = saida / subpastas["insumos"]
         revisao = saida / subpastas["revisao_humana"]
-        for pasta in (revisados, insumos, revisao):
+        for pasta in (revisados, insumos, revisao):  # a subpasta dos atualizados só é criada se for usada
             caminho_gravavel(pasta).mkdir(parents=True, exist_ok=True)
-    pastas_geradas = [p for p in {saida, revisados, insumos, revisao} if p is not None]
+    pastas_geradas = [p for p in {saida, revisados, revisados_alt, insumos, revisao} if p is not None]
     modelo = carregar_modelo()
     rotulos = rotulos_composicao(modelo.ws)
     texto_padrao = cfg["texto_gestor_sem_resposta"]
@@ -1644,13 +1649,15 @@ def cmd_gerar(args, cfg):
                 rel.avisos.append("CNPJ não está na lista de fundos (nome em branco)")
             conf = conferir_cvm(rel, informe, tolerancia) if informe is not None else None
             revisar = bool(conf and conf.revisar)
-            destinos = {"pdf": revisao if revisar else revisados, "xlsx": insumos}
+            pdf_ok = revisados_alt if rel.atualizado_pipefy else revisados
+            destinos = {"pdf": revisao if revisar else pdf_ok, "xlsx": insumos}
             for ext in sorted(formatos):
                 destino = destinos[ext]
                 for outra in pastas_geradas:  # se o fundo trocou de pasta desde a última geração, tira a cópia antiga
                     antigo = outra / f"{rel.nome_arquivo}.{ext}"
                     if outra != destino and antigo.is_file():
                         antigo.unlink()
+                caminho_gravavel(destino).mkdir(parents=True, exist_ok=True)
                 arquivo = destino / f"{rel.nome_arquivo}.{ext}"
                 if ext == "pdf":
                     salvar_pdf(rel, caminho_gravavel(arquivo), args.com_lastro, modelo)
@@ -1698,6 +1705,10 @@ def cmd_gerar(args, cfg):
         n_rev = len({r["cnpj"] for r in revisoes})
         n_ok = sum(1 for r in resumo if r.get("conferencia_cvm") == STATUS_OK)
         print(f"Conferência com a CVM: {n_ok} fundo(s) batem com o informe: PDF em {revisados}")
+        n_alt = sum(1 for r in resumo if r.get("conferencia_cvm") == STATUS_OK and str(revisados_alt) in r["pasta"])
+        if n_alt:
+            print(f"                       ({n_alt} deles, com textos alterados pela planilha do Pipefy, em "
+                  f"{revisados_alt})")
         print(f"                       Excel (draft) de todos os fundos em {insumos}")
         print(f"                       {n_rev} fundo(s) não batem: PDF em {revisao} (detalhes em revisao_cvm.csv)")
     if erros:
