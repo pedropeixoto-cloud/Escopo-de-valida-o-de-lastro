@@ -387,6 +387,20 @@ class TestAtualizacoesPipefy(Base):
         self.assertTrue((ok / "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.pdf").exists())
         self.assertFalse((ok / "FUNDO ALFA FIDC_11111111000111_TRIMESTRAL_CVM.pdf").exists())
 
+    def test_dois_cards_do_mesmo_fundo_vale_o_mais_recente(self):
+        pasta = Path(tempfile.mkdtemp(dir=self.tmp))
+        shutil.copytree(self.tmp / "entrada", pasta / "entrada")
+        _xlsx(pasta / "entrada" / "pipefy_atualizacoes.xlsx",
+              [["Título", "Criado em", "Nome do Fundo", "CNPJ do Fundo", "Descrição item 1"],
+               ["ALFA", dt.datetime(2026, 10, 1, 9, 0), "FUNDO ALFA FIDC", ALFA, "Resposta antiga"],
+               ["ALFA", dt.datetime(2026, 11, 5, 9, 0), "FUNDO ALFA FIDC", ALFA, "Resposta nova"],
+               ["ALFA", dt.datetime(2026, 10, 20, 9, 0), "FUNDO ALFA FIDC", ALFA, "Resposta do meio"]])
+        cfg = dict(self.cfg)
+        cfg["pastas"] = dict(cfg["pastas"], entrada=str(pasta / "entrada"))
+        bases = g.carregar_bases(cfg)
+        self.assertEqual(g.calcular(bases, ALFA, DATA_BASE, self.rotulos, TEXTO_PADRAO).celulas["A59"], "Resposta nova")
+        self.assertTrue(any("vale o criado por último" in a for a in bases.avisos_gerais))
+
     def test_fundo_sem_card_na_base_ganha_os_textos(self):
         bases = self.bases_com([["BETA", "Jurídico", "FUNDO BETA FIDC", BETA, "Política do BETA", "Sem garantias"]])
         beta = g.calcular(bases, BETA, DATA_BASE, self.rotulos, TEXTO_PADRAO)

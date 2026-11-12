@@ -316,6 +316,9 @@ def aplicar_atualizacoes_pipefy(pipefy: list[dict], atualizacoes: list[dict], fu
     def nome_card(linha):
         return norm(coluna(linha, "Nome do Fundo") or coluna(linha, "Título", "Title"))
 
+    def titulo_card(linha):
+        return coluna(linha, "Título", "Title") or coluna(linha, "Nome do Fundo")
+
     por_cnpj: dict[str, list[dict]] = defaultdict(list)
     for linha in atualizacoes:
         cnpj = digitos(coluna(linha, "CNPJ do Fundo", "CNPJ"))
@@ -326,21 +329,29 @@ def aplicar_atualizacoes_pipefy(pipefy: list[dict], atualizacoes: list[dict], fu
         if len(linhas) == 1:
             escolhidas.setdefault(cnpj, linhas[0])
             continue
-        # dois cards com o mesmo CNPJ: vale o que tem o nome do fundo da lista; os outros são procurados pelo nome
-        certos = [l for l in linhas if nome_card(l) == nome_lista.get(cnpj)] or linhas[:1]
-        escolhidas[cnpj] = certos[0]
+        # Vários cards com o mesmo CNPJ. Os que têm o nome de OUTRO fundo da lista vão para esse fundo;
+        # entre os que sobram vale o do nome da lista e, havendo mais de um, o criado por último.
+        restantes = []
         for l in linhas:
-            if l is certos[0]:
-                continue
-            titulo = coluna(l, "Título", "Title") or coluna(l, "Nome do Fundo")
             outro = cnpj_do_nome.get(nome_card(l))
             if outro and outro != cnpj and outro not in por_cnpj:
                 escolhidas[outro] = l
-                avisos.append(f"{origem}: o card '{titulo}' está com o CNPJ de outro fundo; "
+                avisos.append(f"{origem}: o card '{titulo_card(l)}' está com o CNPJ de outro fundo; "
                               "foi aplicado ao fundo de mesmo nome da lista")
             else:
-                avisos.append(f"{origem}: o card '{titulo}' repete o CNPJ {formatar_cnpj(cnpj)} de outro card "
-                              "e foi ignorado (confira o CNPJ no Pipefy)")
+                restantes.append(l)
+        candidatos = [l for l in restantes if nome_card(l) == nome_lista.get(cnpj)] or restantes
+        if not candidatos:
+            continue
+        escolhido = max(candidatos, key=lambda l: str(coluna(l, "Criado em") or ""))  # empate: o primeiro
+        escolhidas[cnpj] = escolhido
+        ignorados = [l for l in restantes if l is not escolhido]
+        if ignorados:
+            mesmo_fundo = all(nome_card(l) == nome_card(escolhido) for l in ignorados)
+            avisos.append(f"{origem}: {len(ignorados) + 1} cards com o CNPJ {formatar_cnpj(cnpj)} "
+                          f"('{titulo_card(escolhido)}'); "
+                          + ("vale o criado por último" if mesmo_fundo else
+                             "os de nome diferente foram ignorados (confira o CNPJ no Pipefy)"))
 
     base = {}
     for linha in pipefy:

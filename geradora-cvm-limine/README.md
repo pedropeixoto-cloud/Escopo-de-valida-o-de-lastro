@@ -51,8 +51,8 @@ Pipefy como `entrada/pipefy_atualizacoes.xlsx`. Ela precisa ter `CNPJ do Fundo` 
 - Só os fundos da extração mudam, e neles só as colunas `Descrição item ...` preenchidas.
 - O que a extração não traz fica como está no `pipefy.xlsx`: os outros fundos e as colunas ausentes
   (por exemplo o item 9, de processos judiciais).
-- Dois cards com o mesmo CNPJ: vale o que tem o nome do fundo da lista. O outro é aplicado ao fundo de
-  mesmo nome, se houver, ou ignorado. Nos dois casos sai um aviso.
+- Vários cards com o mesmo CNPJ: o card com o nome de outro fundo da lista é aplicado a esse fundo; entre
+  os cards do próprio fundo vale o criado por último (`Criado em`). Em todos os casos sai um aviso.
 - O `resumo_geracao.csv` marca os fundos que usaram a extração, e o PDF deles (quando bate com a CVM)
   fica separado em `REVISADOS\ALTERADOS PELA PLANILHA`.
 
