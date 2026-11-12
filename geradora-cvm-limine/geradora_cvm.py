@@ -62,7 +62,23 @@ TEXTOS_GESTOR = {
     112: "Descrição item 8",
 }
 
-CARACTERES_INVALIDOS = '/\\:*?"<>|'
+# Respostas do gestor informadas à mão (entrada/respostas_gestor.xlsx): coluna -> célula do relatório.
+# Têm prioridade sobre o Pipefy e sobre os textos fixos do modelo (A89 e A106).
+SECOES_GESTOR = {
+    "IV - Processos judiciais": 52,
+    "V.a - Política de investimento": 59,
+    "V.b.i - Critérios de concessão": 66,
+    "V.b.ii - Alterações nos critérios": 72,
+    "V.c - Garantias": 77,
+    "V.d.i - Contratos relevantes": 84,
+    "V.d.ii - Caráter da cessão": 89,
+    "V.e - Pré-pagamento": 94,
+    "V.f - Alienação": 100,
+    "V.g - Descontinuidade": 106,
+    "V.h - Regularidade dos fluxos": 112,
+}
+
+CARACTERES_INVALIDOS ='/\\:*?"<>|'
 XML_INVALIDO = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
 DATA_ZERO_EXCEL = dt.date(1899, 12, 30)
 
@@ -243,8 +259,12 @@ class Bases:
     pipefy: list[dict]
     mapeamento: list[tuple[str, str]]
     avisos_gerais: list[str] = field(default_factory=list)
+    respostas: list[dict] = field(default_factory=list)  # entrada/respostas_gestor.xlsx (opcional)
 
     def __post_init__(self):
+        self.respostas_manuais: dict[str, dict] = {}
+        for linha in self.respostas:  # uma linha por fundo; vale a primeira
+            self.respostas_manuais.setdefault(digitos(coluna(linha, "CNPJ do Fundo", "CNPJ")), linha)
         # índices por CNPJ: cada fundo consulta só as próprias linhas
         self.carteira_por_cnpj: dict[str, list[dict]] = defaultdict(list)
         for linha in self.carteira:
@@ -275,6 +295,71 @@ def mapear_descricao(descricao, mapeamento) -> str:
         if chave and chave in texto:
             return destino
     return ""
+
+
+MARCA_ATUALIZADO = "_atualizado_por"
+
+
+def aplicar_atualizacoes_pipefy(pipefy: list[dict], atualizacoes: list[dict], fundos: list[dict],
+                                avisos: list[str], origem: str) -> None:
+    """Sobrepõe uma extração parcial do Pipefy à base (pipefy.xlsx), fundo a fundo.
+
+    Só os fundos da extração mudam, e neles só as colunas "Descrição item ..." preenchidas;
+    o que a extração não traz (outros fundos, outras colunas) fica como está na base.
+    """
+    nome_lista = {}
+    cnpj_do_nome = {}
+    for f in fundos:
+        nome_lista.setdefault(digitos(f["cnpj"]), norm(f["nome"]))
+        cnpj_do_nome.setdefault(norm(f["nome"]), digitos(f["cnpj"]))
+
+    def nome_card(linha):
+        return norm(coluna(linha, "Nome do Fundo") or coluna(linha, "Título", "Title"))
+
+    por_cnpj: dict[str, list[dict]] = defaultdict(list)
+    for linha in atualizacoes:
+        cnpj = digitos(coluna(linha, "CNPJ do Fundo", "CNPJ"))
+        if cnpj:
+            por_cnpj[cnpj].append(linha)
+    escolhidas: dict[str, dict] = {}
+    for cnpj, linhas in por_cnpj.items():
+        if len(linhas) == 1:
+            escolhidas.setdefault(cnpj, linhas[0])
+            continue
+        # dois cards com o mesmo CNPJ: vale o que tem o nome do fundo da lista; os outros são procurados pelo nome
+        certos = [l for l in linhas if nome_card(l) == nome_lista.get(cnpj)] or linhas[:1]
+        escolhidas[cnpj] = certos[0]
+        for l in linhas:
+            if l is certos[0]:
+                continue
+            titulo = coluna(l, "Título", "Title") or coluna(l, "Nome do Fundo")
+            outro = cnpj_do_nome.get(nome_card(l))
+            if outro and outro != cnpj and outro not in por_cnpj:
+                escolhidas[outro] = l
+                avisos.append(f"{origem}: o card '{titulo}' está com o CNPJ de outro fundo; "
+                              "foi aplicado ao fundo de mesmo nome da lista")
+            else:
+                avisos.append(f"{origem}: o card '{titulo}' repete o CNPJ {formatar_cnpj(cnpj)} de outro card "
+                              "e foi ignorado (confira o CNPJ no Pipefy)")
+
+    base = {}
+    for linha in pipefy:
+        base.setdefault(digitos(coluna(linha, "CNPJ do Fundo")), linha)
+    for cnpj, nova in escolhidas.items():
+        campos = {k: v for k, v in nova.items()
+                  if norm(k).startswith("descrição item") and v not in (None, "") and str(v).strip()}
+        if not campos:
+            continue
+        alvo = base.get(cnpj)
+        if alvo is None:
+            alvo = {"Title": coluna(nova, "Título", "Title") or coluna(nova, "Nome do Fundo"),
+                    "CNPJ do Fundo": formatar_cnpj(cnpj)}
+            pipefy.append(alvo)
+            base[cnpj] = alvo
+        chaves = {norm(k): k for k in alvo}
+        for k, v in campos.items():
+            alvo[chaves.get(norm(k), k)] = v
+        alvo[MARCA_ATUALIZADO] = origem
 
 
 def carregar_bases(cfg: dict) -> Bases:
@@ -340,7 +425,22 @@ def carregar_bases(cfg: dict) -> Bases:
         avisos.append(f"Relatório Pipefy não encontrado ({caminho_pipefy}); todos os textos do gestor "
                       "sairão com o texto padrão de 'gestor não se manifestou'.")
 
-    return Bases(fundos, carteira, sinqia, pipefy, mapeamento, avisos)
+    caminho_atual = caminho_cfg(cfg, "entrada") / cfg["arquivos"].get("pipefy_atualizacoes",
+                                                                       "pipefy_atualizacoes.xlsx")
+    if caminho_atual.exists():
+        aplicar_atualizacoes_pipefy(pipefy, ler_tabela(caminho_atual), fundos, avisos, caminho_atual.name)
+
+    respostas = []
+    caminho_respostas = caminho_cfg(cfg, "entrada") / cfg["arquivos"].get("respostas_gestor", "respostas_gestor.xlsx")
+    if caminho_respostas.exists():
+        respostas = ler_tabela(caminho_respostas)
+        desconhecidas = [c for c in (respostas[0] if respostas else {})
+                         if c not in SECOES_GESTOR and c not in ("CNPJ do Fundo", "CNPJ", "Fundo")]
+        if desconhecidas:
+            avisos.append(f"Colunas de {caminho_respostas.name} que não são seções do relatório (ignoradas): "
+                          + "; ".join(map(str, desconhecidas)))
+
+    return Bases(fundos, carteira, sinqia, pipefy, mapeamento, avisos, respostas)
 
 
 def ler_validacao(caminho: Path) -> list[dict]:
@@ -501,10 +601,25 @@ def calcular(bases: Bases, cnpj: str, data_base: dt.date, rotulos_composicao: di
     resposta = bases.pipefy_por_cnpj.get(cnpj_dig)
     if resposta is None:
         avisos.append("Sem resposta do gestor no Pipefy: textos padrão usados")
+    elif resposta.get(MARCA_ATUALIZADO):
+        avisos.append(f"Textos do gestor atualizados por {resposta[MARCA_ATUALIZADO]}")
     c["I5"] = coluna(resposta, "Title") if resposta else None          # título do card (auxiliar)
     for linha, campo in TEXTOS_GESTOR.items():
         valor = coluna(resposta, campo) if resposta else None
         c[f"A{linha}"] = texto_padrao if valor in (None, "") else str(valor)   # =IF(K5="",$I$8,K5)
+
+    manual = bases.respostas_manuais.get(cnpj_dig)
+    if manual:
+        usadas = []
+        for secao, linha in SECOES_GESTOR.items():
+            texto = coluna(manual, secao)
+            if texto not in (None, "") and str(texto).strip():
+                c[f"A{linha}"] = str(texto).strip()
+                usadas.append(secao.split(" - ")[0])
+        if usadas:
+            if resposta is None:
+                avisos[:] = [a for a in avisos if not a.startswith("Sem resposta do gestor no Pipefy")]
+            avisos.append("Textos do gestor de respostas_gestor.xlsx (substituem o Pipefy): " + ", ".join(usadas))
 
     return Relatorio(nome, cnpj, data_base, c, avisos)
 
@@ -1163,6 +1278,7 @@ def salvar_pdf(rel: Relatorio, destino: Path, mostrar_lastro: bool, modelo: Mode
     pos: dict[int, tuple[int, float]] = {}
     y, protegido_ate = topo, 0
     visiveis = list(alturas)
+    quebrou_sozinho = False  # houve quebra automática desde a última quebra manual
     for i, r in enumerate(visiveis):
         if r > protegido_ate:
             fim = fim_mescla.get(r, r)
@@ -1170,13 +1286,18 @@ def salvar_pdf(rel: Relatorio, destino: Path, mostrar_lastro: bool, modelo: Mode
             if y + bloco > limite + 0.01 and paginas[-1]:
                 paginas.append([])
                 y = topo
+                quebrou_sozinho = True
             protegido_ate = fim
         pos[r] = (len(paginas) - 1, y)
         paginas[-1].append(r)
         y += alturas[r]
         if r in g.quebras and i < len(visiveis) - 1:
-            paginas.append([])
-            y = topo
+            # Com textos longos, o conteúdo antes da quebra manual já passou para outra página;
+            # quebrar de novo deixaria essa página quase vazia. Nesse caso a quebra manual é ignorada.
+            if not quebrou_sozinho:
+                paginas.append([])
+                y = topo
+            quebrou_sozinho = False
     paginas = [p for p in paginas if p]
     pagina_de = {r: n for n, linhas in enumerate(paginas) for r in linhas}
 
@@ -1314,8 +1435,7 @@ LINHAS_CONFERIDAS = {
 }
 
 # Subpastas da pasta de saída (config.json -> "subpastas")
-SUBPASTAS_PADRAO = {"revisados": "Relatórios revisados", "insumos": "Insumos",
-                    "revisao_humana": "Revisão humana"}
+SUBPASTAS_PADRAO = {"revisados": "REVISADOS", "revisao_humana": "SEM INFORME", "insumos": "DRAFT EXCEL"}
 
 STATUS_OK = "OK"
 STATUS_CORRIGIDO = "corrigido com a CVM"
@@ -1461,8 +1581,9 @@ def cmd_gerar(args, cfg):
     saida = Path(args.saida) if args.saida else caminho_cfg(cfg, "saida")
     caminho_gravavel(saida).mkdir(parents=True, exist_ok=True)
     # Com a conferência da CVM, os arquivos vão para subpastas da saída:
-    #   batem com o informe -> PDF em "revisados" (pronto para emitir) e XLSX em "insumos"
-    #   não batem           -> PDF e XLSX em "revisão humana" (draft)
+    #   PDF que bate com o informe -> "revisados" (pronto para emitir)
+    #   PDF que não bate           -> "revisao_humana" (com o revisao_cvm.csv)
+    #   XLSX (draft) de todos      -> "insumos"
     informe, revisados, insumos, revisao = None, saida, saida, None
     tolerancia = float(_cfg_cvm(cfg)["tolerancia"])
     if not args.sem_cvm:
@@ -1523,8 +1644,7 @@ def cmd_gerar(args, cfg):
                 rel.avisos.append("CNPJ não está na lista de fundos (nome em branco)")
             conf = conferir_cvm(rel, informe, tolerancia) if informe is not None else None
             revisar = bool(conf and conf.revisar)
-            destinos = {"pdf": revisao if revisar else revisados,
-                        "xlsx": revisao if revisar else insumos}
+            destinos = {"pdf": revisao if revisar else revisados, "xlsx": insumos}
             for ext in sorted(formatos):
                 destino = destinos[ext]
                 for outra in pastas_geradas:  # se o fundo trocou de pasta desde a última geração, tira a cópia antiga
@@ -1578,8 +1698,8 @@ def cmd_gerar(args, cfg):
         n_rev = len({r["cnpj"] for r in revisoes})
         n_ok = sum(1 for r in resumo if r.get("conferencia_cvm") == STATUS_OK)
         print(f"Conferência com a CVM: {n_ok} fundo(s) batem com o informe: PDF em {revisados}")
-        print(f"                       e Excel em {insumos}")
-        print(f"                       {n_rev} fundo(s) para revisão humana em {revisao} (detalhes em revisao_cvm.csv)")
+        print(f"                       Excel (draft) de todos os fundos em {insumos}")
+        print(f"                       {n_rev} fundo(s) não batem: PDF em {revisao} (detalhes em revisao_cvm.csv)")
     if erros:
         print(f"[ERRO] {erros} fundo(s) não foram gerados; veja o resumo.")
         sys.exit(1)

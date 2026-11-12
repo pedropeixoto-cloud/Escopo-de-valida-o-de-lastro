@@ -326,6 +326,65 @@ class TestComandoGerar(Base):
         self.assertEqual(rel.celulas["C15"], 8500.0)
 
 
+class TestRespostasManuais(Base):
+    def test_respostas_manuais_substituem_pipefy_e_textos_fixos(self):
+        pasta = self.tmp / "manuais"
+        shutil.copytree(self.tmp / "entrada", pasta / "entrada")
+        _xlsx(pasta / "entrada" / "respostas_gestor.xlsx", [
+            ["CNPJ do Fundo", "Fundo", "V.a - Política de investimento", "V.d.ii - Caráter da cessão",
+             "V.g - Descontinuidade", "V.c - Garantias"],
+            ["22222222000122", "BETA", "Nova política", "Com coobrigação", "Sem efeito relevante", ""]])
+        cfg = dict(self.cfg)
+        cfg["pastas"] = dict(cfg["pastas"], entrada=str(pasta / "entrada"))
+        bases = g.carregar_bases(cfg)
+        beta = g.calcular(bases, BETA, DATA_BASE, self.rotulos, TEXTO_PADRAO)
+        self.assertEqual(beta.celulas["A59"], "Nova política")
+        self.assertEqual(beta.celulas["A89"], "Com coobrigação")       # texto fixo do modelo
+        self.assertEqual(beta.celulas["A106"], "Sem efeito relevante")  # texto fixo do modelo
+        self.assertEqual(beta.celulas["A77"], TEXTO_PADRAO)             # coluna vazia: mantém o Pipefy/padrão
+        self.assertFalse(any(a.startswith("Sem resposta do gestor") for a in beta.avisos))
+        self.assertTrue(any("respostas_gestor.xlsx" in a for a in beta.avisos))
+        alfa = g.calcular(bases, ALFA, DATA_BASE, self.rotulos, TEXTO_PADRAO)
+        self.assertNotIn("A89", alfa.celulas)                           # outros fundos não mudam
+
+
+class TestAtualizacoesPipefy(Base):
+    def bases_com(self, linhas):
+        pasta = Path(tempfile.mkdtemp(dir=self.tmp))
+        shutil.copytree(self.tmp / "entrada", pasta / "entrada")
+        _xlsx(pasta / "entrada" / "pipefy_atualizacoes.xlsx",
+              [["Título", "Fase atual", "Nome do Fundo", "CNPJ do Fundo", "Descrição item 1", "Descrição item 3"]]
+              + linhas)
+        cfg = dict(self.cfg)
+        cfg["pastas"] = dict(cfg["pastas"], entrada=str(pasta / "entrada"))
+        return g.carregar_bases(cfg)
+
+    def test_so_muda_os_fundos_e_as_colunas_da_extracao(self):
+        bases = self.bases_com([["ALFA", "Jurídico", "FUNDO ALFA FIDC", ALFA, "Política nova", None]])
+        alfa = g.calcular(bases, ALFA, DATA_BASE, self.rotulos, TEXTO_PADRAO)
+        original = self.calcular(ALFA)
+        self.assertEqual(alfa.celulas["A59"], "Política nova")            # item 1 veio da extração
+        for celula in ("A52", "A66", "A72", "A77", "A84", "A94", "A100", "A112"):
+            self.assertEqual(alfa.celulas[celula], original.celulas[celula])  # o resto fica como na base
+        self.assertTrue(any("atualizados por pipefy_atualizacoes.xlsx" in a for a in alfa.avisos))
+        beta = g.calcular(bases, BETA, DATA_BASE, self.rotulos, TEXTO_PADRAO)
+        self.assertEqual(beta.celulas, self.calcular(BETA).celulas)       # fundo fora da extração não muda
+
+    def test_fundo_sem_card_na_base_ganha_os_textos(self):
+        bases = self.bases_com([["BETA", "Jurídico", "FUNDO BETA FIDC", BETA, "Política do BETA", "Sem garantias"]])
+        beta = g.calcular(bases, BETA, DATA_BASE, self.rotulos, TEXTO_PADRAO)
+        self.assertEqual(beta.celulas["A59"], "Política do BETA")
+        self.assertEqual(beta.celulas["A77"], "Sem garantias")
+        self.assertEqual(beta.celulas["A66"], TEXTO_PADRAO)               # coluna que a extração não traz
+
+    def test_card_com_cnpj_de_outro_fundo_vai_pelo_nome(self):
+        bases = self.bases_com([["ALFA", "Jurídico", "FUNDO ALFA FIDC", ALFA, "Do ALFA", None],
+                                ["BETA", "Jurídico", "FUNDO BETA FIDC", ALFA, "Do BETA", None]])
+        self.assertEqual(g.calcular(bases, ALFA, DATA_BASE, self.rotulos, TEXTO_PADRAO).celulas["A59"], "Do ALFA")
+        self.assertEqual(g.calcular(bases, BETA, DATA_BASE, self.rotulos, TEXTO_PADRAO).celulas["A59"], "Do BETA")
+        self.assertTrue(any("CNPJ de outro fundo" in a for a in bases.avisos_gerais))
+
+
 class TestConferenciaCVM(Base):
     def informe(self, **mudancas):
         reg = {k: str(v) for k, v in INFORME_OK[ALFA].items()}
@@ -396,18 +455,18 @@ class TestConferenciaCVM(Base):
         raiz = sorted(p.name for p in (pasta / "saida").iterdir())
         self.assertEqual(raiz, sorted([OK_DIR, INS_DIR, REV_DIR, "resumo_geracao.csv"]))
         self.assertTrue((pasta / "saida" / INS_DIR / "FUNDO ALFA FIDC_11111111000111_TRIMESTRAL_CVM.xlsx").exists())
-        self.assertFalse((pasta / "saida" / INS_DIR / "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.xlsx").exists())
+        self.assertTrue((pasta / "saida" / INS_DIR / "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.xlsx").exists())
         saida = sorted(p.name for p in (pasta / "saida" / OK_DIR).iterdir())
         rev = sorted(p.name for p in (pasta / "saida" / REV_DIR).iterdir())
         self.assertIn("FUNDO ALFA FIDC_11111111000111_TRIMESTRAL_CVM.pdf", saida)
         self.assertFalse([a for a in saida if "BETA" in a])
         self.assertIn("FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.pdf", rev)
-        self.assertIn("FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.xlsx", rev)
+        self.assertFalse([a for a in rev if a.endswith(".xlsx")])          # o Excel (draft) fica separado
         self.assertIn("[REVISAR] FUNDO BETA", log.getvalue())
         csv_rev = (pasta / "saida" / REV_DIR / "revisao_cvm.csv").read_text(encoding="utf-8-sig")
         self.assertIn(g.STATUS_CORRIGIDO, csv_rev)
         self.assertIn("Patrimônio Líquido", csv_rev)
-        ws = openpyxl.load_workbook(pasta / "saida" / REV_DIR / "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.xlsx").active
+        ws = openpyxl.load_workbook(pasta / "saida" / INS_DIR / "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.xlsx").active
         self.assertEqual(ws["C20"].value, 90)
         self.assertEqual(ws["C19"].value, -10)
 

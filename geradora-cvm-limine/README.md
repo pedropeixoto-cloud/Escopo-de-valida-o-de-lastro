@@ -35,12 +35,51 @@ pip install -r requirements.txt
    ```
    _DRAFT\
      resumo_geracao.csv        PL, conferência com a CVM e avisos de cada fundo
-     Relatórios revisados\     PDF dos fundos que batem com o Informe Mensal da CVM (prontos para emitir)
-     Insumos\                  Excel dos fundos que batem
-     Revisão humana\           PDF e Excel (drafts) dos fundos que não batem + revisao_cvm.csv
+     REVISADOS\      PDF dos fundos que batem com o Informe Mensal da CVM (prontos para emitir)
+     SEM INFORME\    PDF dos fundos que não batem com o informe (ou sem informe) + revisao_cvm.csv
+     DRAFT EXCEL\    Excel (draft) de todos os fundos
    ```
    Se algum fundo falhar, os demais são gerados, o erro vai para o resumo e o comando termina
    com código 1.
+
+### Extração parcial do Pipefy (só alguns fundos)
+
+Para atualizar as respostas de alguns fundos sem trocar a base inteira, salve a planilha extraída do
+Pipefy como `entrada/pipefy_atualizacoes.xlsx`. Ela precisa ter `CNPJ do Fundo` e as colunas
+`Descrição item ...`; as demais (`Título`, `Fase atual`, `Criado em`...) são ignoradas.
+
+- Só os fundos da extração mudam, e neles só as colunas `Descrição item ...` preenchidas.
+- O que a extração não traz fica como está no `pipefy.xlsx`: os outros fundos e as colunas ausentes
+  (por exemplo o item 9, de processos judiciais).
+- Dois cards com o mesmo CNPJ: vale o que tem o nome do fundo da lista. O outro é aplicado ao fundo de
+  mesmo nome, se houver, ou ignorado. Nos dois casos sai um aviso.
+- O `resumo_geracao.csv` marca os fundos que usaram a extração.
+
+Ordem de prioridade dos textos: `respostas_gestor.xlsx` → `pipefy_atualizacoes.xlsx` → `pipefy.xlsx` →
+texto padrão.
+
+### Respostas do gestor enviadas fora do Pipefy
+
+Quando o gestor manda as respostas por outro meio (por exemplo, um relatório próprio em PDF), elas vão em
+`entrada/respostas_gestor.xlsx`, uma linha por fundo. As colunas são `CNPJ do Fundo`, `Fundo` (só para
+leitura) e uma por seção do relatório:
+
+| coluna | seção |
+|---|---|
+| `IV - Processos judiciais` | IV. Processos judiciais e/ou administrativos |
+| `V.a - Política de investimento` | V a) |
+| `V.b.i - Critérios de concessão` / `V.b.ii - Alterações nos critérios` | V b) i e ii |
+| `V.c - Garantias` | V c) |
+| `V.d.i - Contratos relevantes` / `V.d.ii - Caráter da cessão` | V d) i e ii |
+| `V.e - Pré-pagamento` | V e) |
+| `V.f - Alienação` | V f) |
+| `V.g - Descontinuidade` | V g) |
+| `V.h - Regularidade dos fluxos` | V h) |
+
+O texto preenchido substitui o do Pipefy e também os textos fixos do modelo (V d) ii e V g)). Coluna
+vazia mantém o Pipefy ou o texto padrão. O resumo indica quais seções vieram desse arquivo. No PDF, se o
+texto empurra o conteúdo para a página seguinte antes da quebra manual do modelo, essa quebra é ignorada
+para não sobrar uma página quase vazia.
 
 ### Conferência automática com a CVM
 
@@ -60,10 +99,12 @@ compara cada linha do quadro I com o informe do fundo:
 
 | Resultado | O que acontece | Pasta |
 |---|---|---|
-| Todas as linhas batem (diferença ≤ `cvm.tolerancia`, R$ 1) | nada | PDF em `Relatórios revisados`, Excel em `Insumos` |
-| Diverge e o informe fecha (ativo − passivo = PL) | o relatório é **corrigido com o valor da CVM** e os % são recalculados | PDF e Excel em `Revisão humana` |
-| Diverge e o informe não fecha ou está zerado | mantém a carteira | `Revisão humana` |
-| Fundo sem informe na CVM no mês | mantém a carteira | `Revisão humana` |
+| Todas as linhas batem (diferença ≤ `cvm.tolerancia`, R$ 1) | nada | PDF em `REVISADOS` |
+| Diverge e o informe fecha (ativo − passivo = PL) | o relatório é **corrigido com o valor da CVM** e os % são recalculados | PDF em `SEM INFORME` |
+| Diverge e o informe não fecha ou está zerado | mantém a carteira | PDF em `SEM INFORME` |
+| Fundo sem informe na CVM no mês | mantém a carteira | PDF em `SEM INFORME` |
+
+O Excel (draft) de todos os fundos fica em `DRAFT EXCEL`, separado dos PDFs.
 
 Os nomes das subpastas ficam em `subpastas` no `config.json`.
 

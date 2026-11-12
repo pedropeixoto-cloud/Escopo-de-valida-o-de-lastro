@@ -8,9 +8,9 @@
   },
 
   "subpastas": {
-      "revisados": "Relatórios revisados",
-      "insumos": "Insumos",
-      "revisao_humana": "Revisão humana"
+      "revisados": "REVISADOS",
+      "revisao_humana": "SEM INFORME",
+      "insumos": "DRAFT EXCEL"
   },
 
   "cvm": {
