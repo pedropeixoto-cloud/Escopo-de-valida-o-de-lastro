@@ -2,3 +2,5 @@
 entrada/*
 !entrada/.gitkeep
 __pycache__/
+# prévias geradas fora da pasta oficial
+previa/

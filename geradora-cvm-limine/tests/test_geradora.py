@@ -274,6 +274,22 @@ class TestComandoGerar(Base):
         resumo = (saida / "resumo_geracao.csv").read_text(encoding="utf-8-sig").splitlines()
         self.assertEqual(sorted(l.split(";")[1] for l in resumo[1:]), [ALFA, BETA])
 
+    def test_fundo_de_outro_administrador_vai_para_a_pasta_propria(self):
+        pasta = self.tmp / "outro_adm"
+        pasta.mkdir()
+        cfg = json.loads(self.config.read_text(encoding="utf-8"))
+        cfg["pastas"] = dict(cfg["pastas"], saida=str(pasta / "saida"))
+        cfg["outro_adm"] = [BETA]
+        config = pasta / "config.json"
+        config.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+        with redirect_stdout(io.StringIO()):
+            g.main(["--config", str(config), "gerar"])
+        destino = pasta / "saida" / g.SUBPASTAS_PADRAO["outro_adm"]
+        self.assertEqual([p.name for p in destino.iterdir()], ["FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.pdf"])
+        self.assertFalse((pasta / "saida" / OK_DIR / "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.pdf").exists())
+        self.assertTrue((pasta / "saida" / OK_DIR / "FUNDO ALFA FIDC_11111111000111_TRIMESTRAL_CVM.pdf").exists())
+        self.assertTrue((pasta / "saida" / INS_DIR / "FUNDO BETA FIDC_22222222000122_TRIMESTRAL_CVM.xlsx").exists())
+
     def test_um_fundo_com_erro_nao_para_o_lote(self):
         bloqueio = self.tmp / "saida_erro" / OK_DIR / "FUNDO ALFA FIDC_11111111000111_TRIMESTRAL_CVM.pdf"
         bloqueio.mkdir(parents=True)          # uma pasta com o nome do PDF impede a gravação

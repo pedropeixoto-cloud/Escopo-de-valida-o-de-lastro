@@ -10,8 +10,16 @@
   "subpastas": {
       "revisados": "REVISADOS",
       "revisao_humana": "SEM INFORME",
-      "insumos": "DRAFT EXCEL"
+      "insumos": "DRAFT EXCEL",
+      "outro_adm": "_OUTRO ADM"
   },
+
+  "outro_adm": [
+      "61.709.339/0001-56",
+      "62.838.025/0001-16",
+      "63.694.302/0001-27",
+      "61.285.603/0001-71"
+  ],
 
   "cvm": {
       "url": "https://dados.cvm.gov.br/dados/FIDC/DOC/INF_MENSAL/DADOS/inf_mensal_fidc_{aaaamm}.zip",

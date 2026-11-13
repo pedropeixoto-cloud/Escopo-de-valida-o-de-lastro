@@ -97,6 +97,11 @@ dessas linhas, e os percentuais são sobre o total (quantidade e valor nominal).
 Com `--cnpj`, o `resumo_geracao.csv` e o `revisao_cvm.csv` mantêm as linhas dos outros fundos e só
 atualizam as dos CNPJs gerados. Um CNPJ da lista sem carteira pode ser gerado assim (sai zerado).
 
+### Fundos com outro administrador
+
+Os CNPJs listados em `outro_adm` no `config.json` têm o PDF gravado em `_DRAFT\_OUTRO ADM`, qualquer que
+seja o resultado da conferência com a CVM. O Excel deles continua em `DRAFT EXCEL`.
+
 ### Conferência automática com a CVM
 
 Antes de gravar, o `gerar` baixa o Informe Mensal FIDC do mês da data base nos dados abertos da CVM

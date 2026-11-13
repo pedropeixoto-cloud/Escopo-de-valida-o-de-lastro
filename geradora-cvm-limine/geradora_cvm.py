@@ -1505,7 +1505,9 @@ LINHAS_CONFERIDAS = {
 # Subpastas da pasta de saída (config.json -> "subpastas")
 SUBPASTAS_PADRAO = {"revisados": "REVISADOS", "revisao_humana": "SEM INFORME", "insumos": "DRAFT EXCEL",
                     # dentro de "revisados": fundos com textos trocados por pipefy_atualizacoes.xlsx
-                    "revisados_atualizados": "ALTERADOS PELA PLANILHA"}
+                    "revisados_atualizados": "ALTERADOS PELA PLANILHA",
+                    # fundos de config.json -> "outro_adm" (hoje com outro administrador)
+                    "outro_adm": "_OUTRO ADM"}
 
 STATUS_OK = "OK"
 STATUS_CORRIGIDO = "corrigido com a CVM"
@@ -1655,17 +1657,21 @@ def cmd_gerar(args, cfg):
     #   PDF que não bate           -> "revisao_humana" (com o revisao_cvm.csv)
     #   XLSX (draft) de todos      -> "insumos"
     informe, revisados, revisados_alt, insumos, revisao = None, saida, saida, saida, None
+    # PDFs dos fundos que passaram para outro administrador: sempre nesta subpasta
+    subpastas = {**SUBPASTAS_PADRAO, **cfg.get("subpastas", {})}
+    cnpjs_outro_adm = {digitos(c) for c in cfg.get("outro_adm", [])}
+    pasta_outro_adm = saida / subpastas["outro_adm"]
     tolerancia = float(_cfg_cvm(cfg)["tolerancia"])
     if not args.sem_cvm:
         informe = ler_informe_cvm(baixar_informe_cvm(cfg, data_base), data_base)
-        subpastas = {**SUBPASTAS_PADRAO, **cfg.get("subpastas", {})}
         revisados = saida / subpastas["revisados"]
         revisados_alt = revisados / subpastas["revisados_atualizados"]
         insumos = saida / subpastas["insumos"]
         revisao = saida / subpastas["revisao_humana"]
         for pasta in (revisados, insumos, revisao):  # a subpasta dos atualizados só é criada se for usada
             caminho_gravavel(pasta).mkdir(parents=True, exist_ok=True)
-    pastas_geradas = [p for p in {saida, revisados, revisados_alt, insumos, revisao} if p is not None]
+    pastas_geradas = [p for p in {saida, revisados, revisados_alt, insumos, revisao, pasta_outro_adm}
+                      if p is not None]
     modelo = carregar_modelo()
     rotulos = rotulos_composicao(modelo.ws)
     texto_padrao = cfg["texto_gestor_sem_resposta"]
@@ -1717,6 +1723,9 @@ def cmd_gerar(args, cfg):
             revisar = bool(conf and conf.revisar)
             pdf_ok = revisados_alt if rel.atualizado_pipefy else revisados
             destinos = {"pdf": revisao if revisar else pdf_ok, "xlsx": insumos}
+            if digitos(cnpj) in cnpjs_outro_adm:
+                destinos["pdf"] = pasta_outro_adm
+                rel.avisos.append("Fundo com outro administrador: PDF em " + pasta_outro_adm.name)
             for ext in sorted(formatos):
                 destino = destinos[ext]
                 for outra in pastas_geradas:  # se o fundo trocou de pasta desde a última geração, tira a cópia antiga
