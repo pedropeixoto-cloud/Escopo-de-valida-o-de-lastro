@@ -47,6 +47,24 @@ MODELO_XLSX = BASE_DIR / "assets" / "modelo_cvm.xlsx"
 
 # Linhas da aba CVM ocultas na planilha original (seções II e III).
 LINHAS_SECAO_LASTRO = range(22, 48)
+# Só a seção II (verificação de lastro), exibida para os fundos de entrada/lastro_manual.xlsx.
+LINHAS_SECAO_II = range(22, 38)
+
+# Verificação de lastro informada à mão (entrada/lastro_manual.xlsx): prefixo da coluna -> linha do quadro II.
+# Cada linha tem três colunas: "<prefixo> - Qtde", "<prefixo> - Nominal" e "<prefixo> - Presente".
+LASTRO_MANUAL = {
+    "A vencer (analisados)": 32,
+    "Vencidos (analisados)": 33,
+    "Substituídos (analisados)": 34,
+    "Inexistentes": 35,
+    "Pendência de lastro": 36,
+}
+
+
+def _linhas_mostradas(mostrar_lastro) -> frozenset:
+    if mostrar_lastro is True:
+        return frozenset(LINHAS_SECAO_LASTRO)
+    return frozenset(mostrar_lastro or ())
 
 # Célula de texto do gestor -> coluna do relatório Pipefy (CVM!I5:AE5 = Pipefy!A:W).
 # CVM!A52 =IF(V5="",$I$8,V5) e V5 = Pipefy coluna N ("Descrição item 9"), etc.
@@ -260,8 +278,12 @@ class Bases:
     mapeamento: list[tuple[str, str]]
     avisos_gerais: list[str] = field(default_factory=list)
     respostas: list[dict] = field(default_factory=list)  # entrada/respostas_gestor.xlsx (opcional)
+    lastro: list[dict] = field(default_factory=list)     # entrada/lastro_manual.xlsx (opcional)
 
     def __post_init__(self):
+        self.lastro_manual: dict[str, dict] = {}
+        for linha in self.lastro:
+            self.lastro_manual.setdefault(digitos(coluna(linha, "CNPJ do Fundo", "CNPJ")), linha)
         self.respostas_manuais: dict[str, dict] = {}
         for linha in self.respostas:  # uma linha por fundo; vale a primeira
             self.respostas_manuais.setdefault(digitos(coluna(linha, "CNPJ do Fundo", "CNPJ")), linha)
@@ -451,7 +473,12 @@ def carregar_bases(cfg: dict) -> Bases:
             avisos.append(f"Colunas de {caminho_respostas.name} que não são seções do relatório (ignoradas): "
                           + "; ".join(map(str, desconhecidas)))
 
-    return Bases(fundos, carteira, sinqia, pipefy, mapeamento, avisos, respostas)
+    lastro = []
+    caminho_lastro = caminho_cfg(cfg, "entrada") / cfg["arquivos"].get("lastro_manual", "lastro_manual.xlsx")
+    if caminho_lastro.exists():
+        lastro = ler_tabela(caminho_lastro)
+
+    return Bases(fundos, carteira, sinqia, pipefy, mapeamento, avisos, respostas, lastro)
 
 
 def ler_validacao(caminho: Path) -> list[dict]:
@@ -477,6 +504,7 @@ class Relatorio:
     celulas: dict  # "B3" -> valor (apenas as células calculadas)
     avisos: list[str]
     atualizado_pipefy: bool = False  # textos do gestor vieram de pipefy_atualizacoes.xlsx
+    linhas_lastro: frozenset = frozenset()  # linhas das seções II/III exibidas só neste fundo
 
     @property
     def nome_arquivo(self) -> str:
@@ -633,8 +661,32 @@ def calcular(bases: Bases, cnpj: str, data_base: dt.date, rotulos_composicao: di
                 avisos[:] = [a for a in avisos if not a.startswith("Sem resposta do gestor no Pipefy")]
             avisos.append("Textos do gestor de respostas_gestor.xlsx (substituem o Pipefy): " + ", ".join(usadas))
 
+    # Verificação de lastro informada à mão: preenche as linhas 32 a 36 e exibe a seção II só neste fundo.
+    # O total (linha 29) passa a ser a soma das linhas 32 a 36, e os % são sobre esse total (qtde e nominal).
+    linhas_lastro = frozenset()
+    lastro = bases.lastro_manual.get(cnpj_dig)
+    if lastro:
+        for prefixo, linha in LASTRO_MANUAL.items():
+            for col, sufixo in (("B", "Qtde"), ("C", "Nominal"), ("D", "Presente")):
+                c[f"{col}{linha}"] = num(coluna(lastro, f"{prefixo} - {sufixo}"))
+        for col in "BCD":
+            c[f"{col}29"] = sum(c[f"{col}{l}"] for l in range(32, 37))
+        for linha in range(32, 37):
+            c[f"E{linha}"] = div(c[f"B{linha}"], c["B29"])
+            c[f"F{linha}"] = div(c[f"C{linha}"], c["C29"])
+        for linha in (30, 31):
+            c[f"E{linha}"] = div(c[f"B{linha}"], c["B29"])
+            c[f"F{linha}"] = div(c[f"C{linha}"], c["C29"])
+        for linha in (27, 28):
+            c[f"E{linha}"] = c[f"F{linha}"] = 0.0
+        c["E29"] = sum(c[f"E{l}"] for l in range(30, 37))
+        c["F29"] = sum(c[f"F{l}"] for l in range(30, 37))
+        linhas_lastro = frozenset(LINHAS_SECAO_II)
+        avisos.append("Seção II (verificação de lastro) exibida com os valores de lastro_manual.xlsx")
+
     return Relatorio(nome, cnpj, data_base, c, avisos,
-                     atualizado_pipefy=bool(resposta and resposta.get(MARCA_ATUALIZADO)))
+                     atualizado_pipefy=bool(resposta and resposta.get(MARCA_ATUALIZADO)),
+                     linhas_lastro=linhas_lastro)
 
 
 # --------------------------------------------------------------------------
@@ -746,7 +798,9 @@ class ModeloCVM:
         return imagem, float(medida["width"]), float(medida["height"])
 
     # ---- XLSX
-    def xlsx(self, celulas: dict, mostrar_lastro: bool) -> bytes:
+    def xlsx(self, celulas: dict, mostrar_lastro) -> bytes:
+        """mostrar_lastro: True (seções II e III inteiras), False, ou o conjunto de linhas a exibir."""
+        mostradas = _linhas_mostradas(mostrar_lastro)
         pendentes = dict(celulas)
 
         def troca(m):
@@ -760,13 +814,13 @@ class ModeloCVM:
         for ref, valor in pendentes.items():
             xml = _inserir_celula(xml, ref, valor)
 
-        marca_oculta = "" if mostrar_lastro else ' hidden="1"'
 
         def oculta(m):
             linha = int(m.group(1))
             if linha not in LINHAS_SECAO_LASTRO:
                 return m.group(0)
             attrs = re.sub(r'\s+hidden="(?:1|true)"', "", m.group(2))
+            marca_oculta = "" if linha in mostradas else ' hidden="1"'
             return f'<row r="{linha}"{attrs}{marca_oculta}{m.group(3)}>'
 
         xml = RE_LINHA.sub(oculta, xml)
@@ -803,7 +857,7 @@ def rotulos_composicao(ws) -> dict:
 
 
 def salvar_xlsx(rel: Relatorio, destino: Path, mostrar_lastro: bool, modelo: ModeloCVM) -> None:
-    caminho_gravavel(destino).write_bytes(modelo.xlsx(rel.celulas, mostrar_lastro))
+    caminho_gravavel(destino).write_bytes(modelo.xlsx(rel.celulas, mostrar_lastro or rel.linhas_lastro))
 
 
 # --------------------------------------------------------------------------
@@ -1257,9 +1311,10 @@ def salvar_pdf(rel: Relatorio, destino: Path, mostrar_lastro: bool, modelo: Mode
     k = g.zoom / 0.68
 
     # 1) linhas visíveis, com a altura impressa
+    mostradas = _linhas_mostradas(mostrar_lastro or rel.linhas_lastro)
     alturas = {}
     for r in range(lin1, lin2 + 1):
-        if r in g.ocultas and not (mostrar_lastro and r in LINHAS_SECAO_LASTRO):
+        if r in g.ocultas and r not in mostradas:
             continue
         alturas[r] = g.alt_linha[r] * g.sy
 
@@ -1695,17 +1750,26 @@ def cmd_gerar(args, cfg):
                            "arquivo": rel.nome_arquivo if rel else "", "conferencia_cvm": "", "pasta": "",
                            "avisos": f"ERRO ao gerar: {type(e).__name__}: {e}"})
 
-    with open(caminho_gravavel(saida / "resumo_geracao.csv"), "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["fundo", "cnpj", "pl", "arquivo", "conferencia_cvm", "pasta", "avisos"],
-                           delimiter=";")
-        w.writeheader()
-        w.writerows(resumo)
-    if revisao is not None:
-        with open(caminho_gravavel(revisao / "revisao_cvm.csv"), "w", encoding="utf-8-sig", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["fundo", "cnpj", "status", "linha", "descricao", "valor_carteira",
-                                              "valor_cvm", "diferenca", "acao"], delimiter=";")
+    campos_resumo = ["fundo", "cnpj", "pl", "arquivo", "conferencia_cvm", "pasta", "avisos"]
+    campos_revisao = ["fundo", "cnpj", "status", "linha", "descricao", "valor_carteira", "valor_cvm",
+                      "diferenca", "acao"]
+    gerados_agora = {digitos(r["cnpj"]) for r in resumo}
+
+    def gravar_csv(caminho: Path, campos: list[str], linhas: list[dict]) -> None:
+        # Gerando só alguns CNPJs, as linhas dos outros fundos que já estavam no arquivo são mantidas.
+        anteriores = []
+        if args.cnpj and caminho.exists():
+            with open(caminho, encoding="utf-8-sig", newline="") as f:
+                anteriores = [r for r in csv.DictReader(f, delimiter=";")
+                              if digitos(r.get("cnpj")) not in gerados_agora]
+        with open(caminho_gravavel(caminho), "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=campos, delimiter=";", extrasaction="ignore", restval="")
             w.writeheader()
-            w.writerows(revisoes)
+            w.writerows(anteriores + linhas)
+
+    gravar_csv(saida / "resumo_geracao.csv", campos_resumo, resumo)
+    if revisao is not None:
+        gravar_csv(revisao / "revisao_cvm.csv", campos_revisao, revisoes)
     print(f"\nExportação em lote concluída: {len(resumo) - erros - nao_listados} fundo(s) em {saida} "
           f"({time.perf_counter() - inicio:.1f}s)")
     if nao_listados:

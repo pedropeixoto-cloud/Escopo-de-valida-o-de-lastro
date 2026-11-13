@@ -82,6 +82,21 @@ vazia mantém o Pipefy ou o texto padrão. O resumo indica quais seções vieram
 texto empurra o conteúdo para a página seguinte antes da quebra manual do modelo, essa quebra é ignorada
 para não sobrar uma página quase vazia.
 
+### Verificação de lastro informada à mão
+
+Para exibir a seção II (verificação de lastro) de um fundo com valores digitados, inclua o fundo em
+`entrada/lastro_manual.xlsx`: `CNPJ do Fundo` e, para cada linha do quadro, três colunas
+(`<linha> - Qtde`, `<linha> - Nominal`, `<linha> - Presente`). As linhas são `A vencer (analisados)`,
+`Vencidos (analisados)`, `Substituídos (analisados)`, `Inexistentes` e `Pendência de lastro`.
+
+Só os fundos desse arquivo saem com a seção II visível (a seção III continua oculta). O total é a soma
+dessas linhas, e os percentuais são sobre o total (quantidade e valor nominal).
+
+### Geração parcial
+
+Com `--cnpj`, o `resumo_geracao.csv` e o `revisao_cvm.csv` mantêm as linhas dos outros fundos e só
+atualizam as dos CNPJs gerados. Um CNPJ da lista sem carteira pode ser gerado assim (sai zerado).
+
 ### Conferência automática com a CVM
 
 Antes de gravar, o `gerar` baixa o Informe Mensal FIDC do mês da data base nos dados abertos da CVM

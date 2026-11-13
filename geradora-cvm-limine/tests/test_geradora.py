@@ -266,6 +266,14 @@ class TestComandoGerar(Base):
         resumo = (pasta / "resumo_geracao.csv").read_text(encoding="utf-8-sig").splitlines()
         self.assertEqual([l.split(";")[1] for l in resumo[1:]], [ALFA, BETA])  # ordem da lista, sem repetição
 
+    def test_gerar_um_cnpj_mantem_os_outros_no_resumo(self):
+        saida = self.tmp / "saida_parcial"
+        self.gerar("--saida", str(saida))
+        codigo, _ = self.gerar("--saida", str(saida), "--cnpj", BETA)
+        self.assertEqual(codigo, 0)
+        resumo = (saida / "resumo_geracao.csv").read_text(encoding="utf-8-sig").splitlines()
+        self.assertEqual(sorted(l.split(";")[1] for l in resumo[1:]), [ALFA, BETA])
+
     def test_um_fundo_com_erro_nao_para_o_lote(self):
         bloqueio = self.tmp / "saida_erro" / OK_DIR / "FUNDO ALFA FIDC_11111111000111_TRIMESTRAL_CVM.pdf"
         bloqueio.mkdir(parents=True)          # uma pasta com o nome do PDF impede a gravação
@@ -414,6 +422,36 @@ class TestAtualizacoesPipefy(Base):
         self.assertEqual(g.calcular(bases, ALFA, DATA_BASE, self.rotulos, TEXTO_PADRAO).celulas["A59"], "Do ALFA")
         self.assertEqual(g.calcular(bases, BETA, DATA_BASE, self.rotulos, TEXTO_PADRAO).celulas["A59"], "Do BETA")
         self.assertTrue(any("CNPJ de outro fundo" in a for a in bases.avisos_gerais))
+
+
+class TestLastroManual(Base):
+    def test_lastro_manual_preenche_e_exibe_a_secao_ii_so_no_fundo(self):
+        pasta = self.tmp / "lastro_manual"
+        shutil.copytree(self.tmp / "entrada", pasta / "entrada")
+        colunas = ["CNPJ do Fundo"] + [f"{p} - {s}" for p in g.LASTRO_MANUAL for s in ("Qtde", "Nominal", "Presente")]
+        _xlsx(pasta / "entrada" / "lastro_manual.xlsx",
+              [colunas, [BETA, 90, 900.0, 800.0, 10, 100.0, 90.0, 0, 0, 0, 0, 0, 0, 0, 0, 0]])
+        cfg = dict(self.cfg)
+        cfg["pastas"] = dict(cfg["pastas"], entrada=str(pasta / "entrada"))
+        bases = g.carregar_bases(cfg)
+        beta = g.calcular(bases, BETA, DATA_BASE, self.rotulos, TEXTO_PADRAO)
+        c = beta.celulas
+        self.assertEqual((c["B29"], c["C29"], c["D29"]), (100, 1000.0, 890.0))   # total = soma das linhas 32 a 36
+        self.assertAlmostEqual(c["E32"], 0.9)
+        self.assertAlmostEqual(c["F33"], 0.1)                                    # % sobre o valor nominal
+        self.assertAlmostEqual(c["E29"], 1.0)
+        self.assertEqual(beta.linhas_lastro, frozenset(g.LINHAS_SECAO_II))
+        alfa = g.calcular(bases, ALFA, DATA_BASE, self.rotulos, TEXTO_PADRAO)
+        self.assertEqual(alfa.linhas_lastro, frozenset())
+        # no XLSX, a seção II aparece no BETA e continua oculta no ALFA; a seção III fica oculta nos dois
+        for rel, visivel in ((beta, True), (alfa, False)):
+            destino = pasta / f"{rel.nome_arquivo}.xlsx"
+            g.salvar_xlsx(rel, destino, False, self.modelo)
+            ws = openpyxl.load_workbook(destino).active
+            self.assertEqual(not ws.row_dimensions[29].hidden, visivel)
+            self.assertTrue(ws.row_dimensions[44].hidden)
+        g.salvar_pdf(beta, pasta / "beta.pdf", False, self.modelo)
+        self.assertTrue((pasta / "beta.pdf").stat().st_size > 1000)
 
 
 class TestConferenciaCVM(Base):
